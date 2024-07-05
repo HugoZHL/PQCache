@@ -1,0 +1,20 @@
+model:
+  type: inf-llm
+  # path: meta-llama/Llama-2-7b-chat-hf
+  path: ./pqcache/llama-32k
+  block_size: 128
+  fattn: true
+  n_init: 32
+  n_local: 0
+  topk: 0
+  repr_topk: 1
+  max_cached_block: 16
+  exc_block_size: 512
+  base: 100000
+  distance_scale: 1.0
+  async_global_stream: true
+  perhead: true
+
+max_len: 3500
+chunk_size: 35000
+conv_type: mistral-inst

@@ -1,0 +1,22 @@
+model:
+  type: inf-llm
+  path: ./pqcache/Mistral-32k
+  block_size: 128
+  n_init: 32
+  n_local: 0
+  topk: 0
+  repr_topk: 1
+  max_cached_block: 32
+  exc_block_size: 512
+  fattn: true
+  base: 1000000
+  distance_scale: 1.0
+  async_global_stream: true
+  faiss: false
+  perhead: false
+
+
+max_len: 32000 # To align with configs in other baseline
+truncation: suffix # why not align with longbench?
+chunk_size: 35000 # 这里是否需要对齐?
+conv_type: mistral-inst
