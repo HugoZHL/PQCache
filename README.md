@@ -1,4 +1,4 @@
-# PQCache: Product Quantization-based KVCache for Long Context LLM Inference ([Paper](https://hugozhl.github.io/files/PQCache.pdf))
+# PQCache: Product Quantization-based KVCache for Long Context LLM Inference ([Paper](https://arxiv.org/abs/2407.12820))
 
 Codes for the paper "PQCache: Product Quantization-based KVCache for Long Context LLM Inference".
 
@@ -58,4 +58,4 @@ During the development and implementation of PQCache, we learned a lot and borro
 [Hetu](https://github.com/PKU-DAIR/Hetu)
 
 ## Citation
-If you find this work useful, please cite [our paper](https://hugozhl.github.io/files/PQCache.pdf).
+If you find this work useful, please cite [our paper](https://arxiv.org/abs/2407.12820).
