@@ -118,6 +118,50 @@ class SparseQ(nn.Module):
         )
         return (query_proj @ key_proj_buffer).div_(scale)
 
+    def forward_gpu(self, query: Tensor, gpu_key: Tensor, gpu_cur_key: Tensor) -> Tensor:
+        """Compute approximate score for each (query, key).
+
+        query -- (batch, n_kv_heads, n_heads_per_kv, 1, head_size)
+
+        gpu_key -- (batch, n_kv_heads, head_size, seq_len)
+
+        gpu_cur_key -- (batch, n_kv_heads, 1, head_size, 1)
+
+        returns -- (batch, n_kv_heads, n_heads_per_kv, 1, key)
+        """
+        assert gpu_key.device != torch.device("cpu") and gpu_cur_key != torch.device("cpu")
+        assert query.shape[-2] == 1, "no support for multiple queries"
+        head_size = query.shape[-1]
+
+        # Sum the magnitudes within KV groups before top-k
+        # topk indices shape -- (batch, n_kv_heads, 1, 1, rank)
+        topk_indices = query.abs() \
+                            .sum(dim=2, keepdim=True) \
+                            .topk(dim=-1, k=self.settings.rank) \
+                            .indices
+                    
+        query_proj = gather(query, -1, topk_indices)
+        key_proj_buffer = query_proj.new_empty([*gpu_cur_key.shape[:-2], self.settings.rank, gpu_key.shape[-1] + 1])
+                                    
+        key_proj_buffer[...,:-1].copy_(gather(gpu_key.unsqueeze(2), -2, topk_indices.transpose(-1, -2)), non_blocking=True)
+        key_proj_buffer[...,-1:] = gather(gpu_cur_key, -2, topk_indices.transpose(-1, -2))
+
+        # Scale could be:
+        #  - sqrt(head_size) -- if we think our approximation is exact
+        #  - sqrt(rank)      -- if our approximation is no better than random
+        #  - sqrt(q_coverage * head_size) -- used below
+        #       q_coverage estimates the variance of Q K^T from the approximated
+        #       product, and the L1 coverage of Q by the topk components
+        scale = (
+            query_proj.abs()
+            .sum(-1)
+            .div_(query.abs().sum(-1))
+            .mul_(head_size)
+            .pow_(0.5)
+            .unsqueeze(-1)
+        )
+        return (query_proj @ key_proj_buffer).div_(scale)
+
 
 ScoreSettings = Union[LowRank.Settings, SparseQ.Settings]
 
@@ -306,6 +350,108 @@ class AnnAttention(nn.Module):
         )
         # Note: expand indices as scatter does not broadcast (!)
         return output.flatten(1, 2)
+
+    # Put KV cache on GPU, only for accuracy test
+    def forward_gpu_kv(
+        self, query: Tensor, key: Tensor, value: Tensor, logmask: Tensor, gpu_kv
+    ) -> Tuple[Tensor, Tensor]:
+        """Preprocess (key, value, mask) for ANN attention.
+
+        query -- (batch, n_heads, 1, head_size)
+
+        key -- (batch, n_kv_heads, 1, head_size)
+
+        value -- (batch, n_kv_heads, 1, head_size)
+
+        logmask -- (batch, n_heads, 1, seq)
+
+        returns -- (output, weights)
+                   output -- (batch, n_heads, 1, head_size)
+                   weights -- (batch, n_heads, 1, seq)
+        """
+        batch, n_kv_heads, _, head_size = key.shape
+        key_gpu, value_gpu, s_contiguous_key_gpu = gpu_kv
+        seq = key_gpu.shape[-2] + 1
+        n_heads_per_kv = query.shape[1] // n_kv_heads
+
+        # Group by KV head
+        query, key, value, logmask = map(
+            partial(torch.unflatten, dim=1, sizes=(n_kv_heads, -1)),
+            [query, key, value, logmask],
+        )
+
+        assert query.shape == (batch, n_kv_heads, n_heads_per_kv, 1, head_size), query.shape
+        assert key.shape == (batch, n_kv_heads, 1, 1, head_size), key.shape
+        assert value.shape == (batch, n_kv_heads, 1, 1, head_size), value.shape
+        assert logmask.shape == (batch, n_kv_heads, n_heads_per_kv, 1, seq), logmask.shape
+
+        # Calculate an approximate score for each (query, key) pair
+        # shape -- (batch, n_kv_heads, n_heads_per_kv, 1, seq)
+        score = (self.score.forward_gpu(query, s_contiguous_key_gpu, key.transpose(3,4)) + logmask).float()
+
+        # Set the score of local keys (+1 current) to max
+        causal_index = sparse_attention.causal_index(logmask[...,:-1])
+
+        # MODIFIED: add "sink token" trick.
+        is_local = (0 <= causal_index) & (causal_index < self.settings.local_k)
+        is_sink = (causal_index >= (seq - self.settings.sink - 1))
+        assert torch.sum(is_sink[0,0,0,0]) == self.settings.sink
+        topk_score = score[...,:-1].masked_fill(torch.logical_or(is_local, is_sink), torch.finfo(score.dtype).max).sum(
+            dim=2, keepdim=True
+        )
+        # Find max-score keys (note: +1 because the current token's k comes "for free")
+        indices = topk_score.topk(
+            min(self.settings.k + self.settings.sink, score.shape[-1]), -1
+        ).indices  # (batch, n_kv_heads, 1, 1, k + sink + 1)
+        if self.debug_indices is not None:
+            self.debug_indices.append(indices)
+
+        # Optional "mean_value" kv, but we discard this trick here.
+        # NOTE: different from original implementation, here we assumes logmask are full of zeros.
+        # value_mask = (
+        #     logmask[:, :, :1].squeeze(-2).unsqueeze(-1).exp()
+        # )  # (batch, n_kv_heads, 1, seq, 1)
+
+        # MODIFIED: datatype conversion, half -> float -> half
+        self.mean_v = ((self.mean_v * (seq - 1) + value.to(torch.float32)) / seq) # (batch, n_kv_heads, 1, 1, dim)
+        cur_mean_v = self.mean_v.half()
+
+        # Do not use all value tensor to calculate mean value
+        # mean_value = ((value * value_mask).to(torch.float32).sum(-2) / value_mask.to(torch.float32).sum(-2)).unsqueeze(
+        #     -2
+        # ).half()  # (batch, n_kv_heads, 1, 1, 1)
+        kv_weight = torch.tensor(1.0, device=query.device)
+        if self.settings.reallocate_to_mean_value:
+            norm_score = torch.softmax(score, -1) # (batch, n_kv_heads, n_heads_per_kv, 1, seq)
+            kv_weight = (
+                gather(norm_score, -1, indices)  # no need to expand here
+                .sum(-1)
+                .add(norm_score[...,-1])
+                .to(value.dtype)
+            )  # (batch, n_kv_heads, n_heads_per_kv, 1)
+
+        # Slice key, value, logmask for attention
+        kv_indices = indices.squeeze(-2).unsqueeze(-1)  # (batch, n_kv_heads, 1, k, 1)
+        
+        final_key = query.new_empty([batch, n_kv_heads, 1, kv_indices.shape[-2] + 1, head_size])
+        final_value = query.new_empty([batch, n_kv_heads, 1, kv_indices.shape[-2] + 1, head_size])
+        
+        final_key[...,:-1,:].copy_(gather(key_gpu.unsqueeze(2), -2, kv_indices), non_blocking=True)
+        final_value[...,:-1,:].copy_(gather(value_gpu.unsqueeze(2), -2, kv_indices), non_blocking=True)
+        
+        final_key[...,-1:,:], final_value[...,-1:,:] = key, value
+        cur_index = indices.new_zeros([batch, n_kv_heads, 1, 1, 1]) + seq - 1
+        output, weights = self._attention(
+            query,
+            final_key,
+            final_value,
+            gather(logmask, -1, torch.concat([indices, cur_index], dim = -1)),
+            kv_weight=kv_weight,
+            mean_value=cur_mean_v,
+        )
+        # Note: expand indices as scatter does not broadcast (!)
+        return output.flatten(1, 2)
+
 
 Model = Union[GPTNeoXForCausalLM, LlamaForCausalLM, MistralForCausalLM]
 

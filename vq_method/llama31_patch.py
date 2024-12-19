@@ -2,20 +2,18 @@ import os
 import math
 import torch
 import types
-import numpy as np
 from torch import nn
 import matplotlib.pyplot as plt
-from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from typing import List, Optional, Tuple, Union
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaForCausalLM,
     LlamaDecoderLayer,
     LlamaModel,
-    rotate_half,
     repeat_kv,
+    apply_rotary_pos_emb
 )
 from .baseline_compressor import *
 from .flash_attn_with_score import flash_attn_with_score
@@ -24,8 +22,6 @@ from .retrieval_based.sparq import *
 from flash_attn import flash_attn_func
 import seaborn as sns
 from loguru import logger
-
-__all__ = ["VQLlamaForCausalLM", "VQLlamaAttention"]
 
 
 def layer2device(idx, layer_cnt):
@@ -39,16 +35,6 @@ def get_device(layer: nn.Module):
         return param.device
 
 
-def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
-    
-    cos = cos.squeeze(1).squeeze(0)  
-    sin = sin.squeeze(1).squeeze(0)  
-    cos = cos[position_ids].unsqueeze(1)  
-    sin = sin[position_ids].unsqueeze(1)  
-    x_embed = (x * cos) + (rotate_half(x) * sin)
-    return x_embed
-
-
 def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
     def forward(
@@ -56,10 +42,12 @@ def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        padding_mask: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
         assert bsz == 1, "Do not support bsz > 1 yet."
@@ -78,33 +66,38 @@ def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        first_time = past_key_value is None
-        position_length = key_states.shape[-2]
-        if not first_time:
-            assert position_ids.nelement() == 1
-            if position_length < position_ids.item() + 1:
-                position_length = position_ids.item() + 1
+        first_time = (position_ids.nelement() != 1)
 
-        cos, sin = self.rotary_emb(value_states, seq_len=position_length)
-        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
-        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
-        
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
         if first_time:
             self.seq_cnt += 1
             self.fwd_cnt = 0
         
-        if self.compressor == "original":
-            if past_key_value is not None:
-                key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        
+        # It essentially concat new key/value tensor with the history tensor.
+        # if past_key_value is not None:
+            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, None)
 
-            past_key_value = (key_states, value_states) if use_cache else None
+        # It essentially concat new key/value tensor with the history tensor.
+        # if past_key_value is not None:
+            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, None)
+        if self.compressor == "original":
+
+            if past_key_value is not None:
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, None)
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
             
             if self.fwd_cnt <= 0 and self.idx <= 0:
                 print(f"Using naive flash-attn, NO COMPRESSION IS CONVEYED NOW, {os.getpid()}")
+            
+            
+            # TODO: 这里的Decoding能否换成varlen_func来加速？
+
+            # TODO: 这里的Decoding能否换成varlen_func来加速？
             attn_output = flash_attn_func(
                     query_states.transpose(1,2),
                     key_states.transpose(1,2),
@@ -113,11 +106,11 @@ def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
                 ).transpose(1,2)
         elif self.compressor in ["pq_search", "sparq_f"]: 
             if first_time:
-                past_key_value = (key_states, value_states) if use_cache else None
-                attn_output, _ = self.kvcache_quantizer.prefill_attn(query_states, past_key_value)
+                attn_output, _ = self.kvcache_quantizer.prefill_attn(query_states, (key_states, value_states))
                 
-                past_key_value = (key_states.new_zeros([1]), value_states.new_zeros([1])) 
+                _,_ = past_key_value.update(key_states[...,:1].clone(), value_states[...,:1].clone(), self.layer_idx, None)
             else:
+                
                 key_states = repeat_kv(key_states, self.num_key_value_groups) 
                 value_states = repeat_kv(value_states, self.num_key_value_groups)
                 attn_output = self.kvcache_quantizer.decoding_attn(
@@ -126,38 +119,38 @@ def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
                                                     key_states, value_states).to(query_states.dtype)
                 attn_output = attn_output.to(query_states.dtype)
         else: 
-            if past_key_value is not None:
-                key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            assert past_key_value is not None
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, None)
+            kv = (key_states, value_states)
 
-            past_key_value = (key_states, value_states) if use_cache else None
-
+            
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
             if self.use_flash_attn and first_time:
-
+                
+                
                 attn_output, score = flash_attn_with_score(query_states, key_states, value_states, \
                                                             phase="prefill", gumbel_adjustment=False, \
                                                             score_func=self.score_func)
                 score = score.reshape([bsz, self.num_key_value_heads, self.num_key_value_groups, q_len])
-
+                
                 if self.score_func == "sum":
                     score = score.sum(dim=2)
                 elif self.score_func == "max":
                     score = score.max(dim=2).values
                 else:
                     raise Exception(f"Given score func {self.score_func} do not support yet.")
-                compressed_k, compressed_v, _ = self.kvcache_quantizer.apply(past_key_value, 
-                                                                                        attention_score=score, 
-                                                                                        query_states=query_states)
-
-                past_key_value = (compressed_k, compressed_v)
+                compressed_k, compressed_v, _ = self.kvcache_quantizer.apply(kv, 
+                                                                            attention_score=score, 
+                                                                            query_states=query_states)
             else:
                 attention_mask = None 
                 attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
                 attn_weights = self.kvcache_quantizer.restore(
                     attn_weights, self.num_key_value_groups).to(query_states.dtype)
+    
+                
                 attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -221,7 +214,7 @@ def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
         else:
             if attn.idx <= 2:
                 print(f"Using Sparq Compressor, gpu version.")
-            attn.kvcache_quantizer = SparQCompressorGPU(
+            attn.kvcache_quantizer = SparQCompressor(
                 config.compress_ratio,
                 config.recent_ratio,
                 config.sink_size,
@@ -239,6 +232,7 @@ def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
     else:
         raise Exception("Invalid compression strategy name")
 
+    
 def LlamaDecoderLayerPatch(layer: LlamaDecoderLayer, config, layer_idx):
     layer.device = layer2device(layer_idx, config.num_hidden_layers)
     LlamaAttentionPatch(layer.self_attn, config, layer_idx)
@@ -246,64 +240,66 @@ def LlamaDecoderLayerPatch(layer: LlamaDecoderLayer, config, layer_idx):
 
 def PPLlamaModelPatch(model:LlamaModel, config):
     def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-        elif input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
-
-        if position_ids is None:
-            raise Exception("We assume that position id is not None")
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+        assert inputs_embeds is None
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        padding_mask = None
+        return_legacy_cache = False
+        if use_cache and not isinstance(past_key_values, Cache):  
+            return_legacy_cache = True
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            logger.warning_once(
+                "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
+                "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
+            )
 
-        attention_mask = None
+        if cache_position is None or position_ids is None:
+            raise Exception("We don't expect this case to happen")
+
+        causal_mask = None 
+
         hidden_states = inputs_embeds
 
+        
+        position_embeddings = None 
+
+        
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        next_decoder_cache = () if use_cache else None
+        next_decoder_cache = None
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            past_key_value = past_key_values[idx] if len(past_key_values) == len(self.layers) else None
             if past_key_value is not None:
                 assert past_key_values[idx][0].device == get_device(decoder_layer)
-
+            
             if hidden_states.device != decoder_layer.device:
                 hidden_states = hidden_states.to(decoder_layer.device)
 
@@ -315,31 +311,35 @@ def PPLlamaModelPatch(model:LlamaModel, config):
 
             layer_outputs = decoder_layer(
                 hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_value,
+                past_key_value=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                padding_mask=padding_mask,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
             )
 
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
         if hidden_states.device != get_device(self.norm):
             hidden_states = hidden_states.to(get_device(self.norm))
-
         hidden_states = self.norm(hidden_states)
 
+        
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
+        if return_legacy_cache:
+            next_cache = next_cache.to_legacy_cache()
+
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
@@ -364,7 +364,7 @@ def PPLlamaModelPatch(model:LlamaModel, config):
     return model.half()
     
 
-class VQLlamaForCausalLM(LlamaForCausalLM):
+class VQLlama31ForCausalLM(LlamaForCausalLM):
     def __init__(self, config):
         a = time.perf_counter()
         super().__init__(config)
@@ -385,20 +385,72 @@ class VQLlamaForCausalLM(LlamaForCausalLM):
         print(f"Init model from llama patch, Time elapsed:{c - b}, {b - a}")
         self.gradient_checkpointing = False
         self.post_init()
-        torch.cuda.empty_cache()
+    
+    
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None, 
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None, 
+        position_ids=None, 
+        use_cache=True,
+        **kwargs,
+    ):
+        
+        
+        
+        is_decoding = (cache_position.nelement() == 1)
+        
+        if past_key_values is not None:
+            assert inputs_embeds is None
+            if is_decoding:
+                assert input_ids.shape[1] != cache_position.shape[0]  
+                input_ids = input_ids[:, cache_position]
+            else:
+                assert input_ids.shape[1] == cache_position.shape[0]
+
+        
+        if attention_mask is not None and position_ids is None:
+            
+            assert len(attention_mask.shape) == 2 and attention_mask.shape[0] == 1, attention_mask.shape
+            assert attention_mask.nelement() == (cache_position[-1].item()+1), f"{attention_mask.nelement()},{cache_position}"
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        
+        if inputs_embeds is not None and cache_position[0] == 0:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids.contiguous()}  
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
 
     def forward(
             self,
             input_ids: torch.LongTensor = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -416,24 +468,16 @@ class VQLlamaForCausalLM(LlamaForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        
+        
+        logits = self.lm_head(hidden_states[:,-1:,:])
         logits = logits.float()
 
         loss = None
-        if labels is not None:
-            
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

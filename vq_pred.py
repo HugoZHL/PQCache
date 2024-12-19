@@ -9,18 +9,22 @@ import numpy as np
 import random
 import argparse
 from vq_method.llama_patch import VQLlamaForCausalLM
+from vq_method.llama31_patch import VQLlama31ForCausalLM
+
 from vq_method.mistral_patch import VQMistralForCausalLM
 from h2o_method.h2o_attention import H2OLlamaForCausalLM, H2OLlamaAttention
 from vq_method.retrieval_based.pq_search import initialize_objects
+
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import time
+from loguru import logger
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
-    compressor_choices = ["off", "original", "no_drop_lb", "pq_search","sparq_f"]
+    compressor_choices = ["h2o", "original", "no_drop_lb", "pq_search","sparq_f"]
     parser.add_argument('--model', type=str, default=None, choices=[
-        "llama-7b", "llama2-7b-chat-4k", "llama2-7b-32K", "mistral-7b-Instruct-32k", "longchat-v1.5-7b-32k",
+        "llama-7b", "llama2-7b-chat-4k", "llama2-7b-32K", "mistral-7b-Instruct-32k", "llama-3.1","longchat-v1.5-7b-32k",
         "xgen-7b-8k", "internlm-7b-8k", "chatglm2-6b", "chatglm2-6b-32k", "chatglm3-6b-32k", "vicuna-v1.5-7b-16k"])
     parser.add_argument('--e', action='store_true',
                         help="Evaluate on LongBench-E")
@@ -29,12 +33,19 @@ def parse_args(args=None):
     parser.add_argument("--recent_ratio", type=float, default=1)
     parser.add_argument('--enable_vq_cache', action='store_true')
     parser.add_argument('--enable_h2o_cache', action='store_true')
-    parser.add_argument("--sink-size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--sink-size", type=int, default=2)
+    parser.add_argument("--keyformer_mode",type=int, default=0)
+    parser.add_argument("--drop_ratio", type=float, default=0)
     parser.add_argument("--exp_name", type=str, default="dafault_exp")
+    parser.add_argument("--preserve_layer", type=int, default=0)
+    parser.add_argument("--score_func", type=str, default="sum")
     parser.add_argument("--compressor", type=str, default="off", choices=compressor_choices)
+    parser.add_argument("--threshold", type=float, default=1)
     parser.add_argument("--n_subvec_per_head", type=int, default=0)
     parser.add_argument("--n_subbits", type=int, default=0)
     parser.add_argument("--topr", type=int, default=32)
+    parser.add_argument("--recent_size", type=int, default=32)
     parser.add_argument("--gqa", type=str, default="True")
     parser.add_argument("--sparq_mean_v_trick", type=str, default="False")
     parser.add_argument("--max_iter", type=int, default=0)
@@ -43,11 +54,11 @@ def parse_args(args=None):
         action="store_true",
         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
     )
-    parser.add_argument('--dp', action='store_true',help='whether data parallel')
+    parser.add_argument('--dp', action='store_true',
+                        help='whether data parallel')
     parser.add_argument('--pp-size', type=int, choices=[1,2,4,8])
+    parser.add_argument('--test_mode', action='store_true')
     return parser.parse_args(args)
-
-# This is the customized building prompt for chat models
 
 def build_chat(tokenizer, prompt, model_name):
     if "chatglm3" in model_name:
@@ -61,7 +72,18 @@ def build_chat(tokenizer, prompt, model_name):
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
     elif "llama" in model_name:
-        prompt = f"[INST]{prompt}[/INST]"
+        if "3" in model_name:
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ]
+            prompt = tokenizer.apply_chat_template(
+                                    messages,
+                                    tokenize=False,
+                                    add_generation_prompt=True
+                                )
+        else:
+            prompt = f"[INST]{prompt}[/INST]"
     elif "mistral" in model_name:
         prompt = f"[INST]{prompt}[/INST]"
     elif "xgen" in model_name:
@@ -85,10 +107,27 @@ def post_process(response, model_name):
 
 def get_pred(args, model, tokenizer, rank, world_size, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path):
     data_idx = None
-    # data_idx = 1
+    device = model.device
     
+    min_ctx_length = 100000
+    max_ctx_length = 0
+    line_num = 0
+    all_time_elapsed = 0
+    all_tt2t = 0
+    all_token_generated = 0
+    if not os.path.exists(out_path):
+        line_num = 0
+    else:
+        with open(out_path, "r", encoding="utf-8") as f:
+            while True:
+                l = f.readline()
+                if l == "":
+                    break
+                line_num += 1
     for i, json_obj in tqdm(enumerate(data)):
-        a = time.perf_counter()
+        if i < line_num:
+            continue
+
         if data_idx is not None and i != (data_idx - 1):
             continue
         
@@ -99,29 +138,30 @@ def get_pred(args, model, tokenizer, rank, world_size, data, max_length, max_gen
         if "chatglm3" in model_name:
             tokenized_prompt = tokenizer(
                 prompt, truncation=False, return_tensors="pt", add_special_tokens=False).input_ids[0]
-        original_token_cnt = len(tokenized_prompt) # 可能不准，因为可能要应用template。
+        original_token_cnt = len(tokenized_prompt)
         if len(tokenized_prompt) > max_length:
             half = int(max_length/2)
             prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True)+tokenizer.decode(
                 tokenized_prompt[-half:], skip_special_tokens=True)
             original_token_cnt = max_length
 
-        # chat models are better off without build prompts on these tasks
         if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
             prompt = build_chat(tokenizer, prompt, model_name)
         if "chatglm3" in model_name:
             if dataset in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
                 input = tokenizer(prompt, truncation=False,
-                                  return_tensors="pt").to(device)
+                                    return_tensors="pt").to(device)
             else:
                 input = prompt.to(device)
         else:
             input = tokenizer(prompt, truncation=False,
-                              return_tensors="pt").to(device)
+                                return_tensors="pt").to(device)
             
         context_length = input.input_ids.shape[-1]
-        print("MAX_GEN", max_gen, "context_length", context_length)
-        # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
+        min_ctx_length = min(min_ctx_length, context_length)
+        max_ctx_length = max(max_ctx_length, context_length)
+
+        begin_gen = time.perf_counter()
         if dataset == "samsum":
             output = model.generate(
                 **input,
@@ -143,6 +183,9 @@ def get_pred(args, model, tokenizer, rank, world_size, data, max_length, max_gen
                 do_sample=False,
                 temperature=1.0,
             )[0]
+        end_gen = time.perf_counter()
+        all_time_elapsed += end_gen - begin_gen
+        all_token_generated += output[context_length:].shape[0]
 
         if args.enable_h2o_cache:
             for name, m in model.named_modules():
@@ -166,8 +209,8 @@ def get_pred(args, model, tokenizer, rank, world_size, data, max_length, max_gen
                         "request_time": {"batch_time": 0, "batch_size": 1}, 
                         "input_tokens":int(original_token_cnt)}, f, ensure_ascii=False)
             f.write('\n')
-        print(f"elapsed:{time.perf_counter()-a}")
-    # dist.destroy_process_group()
+    print("minimum length is ", min_ctx_length, "maximum", max_ctx_length)
+    print("It takes", all_time_elapsed, "s to generate", all_token_generated, "tokens. tt2t is ", all_tt2t)
 
 
 def seed_everything(seed):
@@ -193,7 +236,12 @@ def load_model_and_tokenizer(args, path, model_name, device, pp_size = 1):
         config.important_ratio = args.important_ratio
         config.pp_size = pp_size
         config.sink_size = args.sink_size
+        config.keyformer_mode = (args.keyformer_mode == 1)
+        config.drop_ratio = args.drop_ratio
+        config.preserve_layer = args.preserve_layer
+        config.score_func = args.score_func
         config.compressor = args.compressor
+        config.threshold = args.threshold
         config.n_subvec_per_head = args.n_subvec_per_head
         config.n_subbits = args.n_subbits
         config.topr = args.topr
@@ -203,7 +251,7 @@ def load_model_and_tokenizer(args, path, model_name, device, pp_size = 1):
         config.device = torch.device("cuda:0")
 
         if config.compressor == "pq_search":
-            config.max_seq_len = 36000
+            config.max_seq_len = 33000
             config.cache_block_size = 128
             config.global_cache_size = 4096
             config.cache_topk = 32
@@ -215,14 +263,13 @@ def load_model_and_tokenizer(args, path, model_name, device, pp_size = 1):
         
         model = VQMistralForCausalLM.from_pretrained(path, config=config)
         model = model.half().eval()
-    elif "llama" in model_name:
-        # replace_llama_attn_with_flash_attn()
-        # tokenizer = LlamaTokenizer.from_pretrained(path)
+    elif "llama" in model_name and "2" in model_name:
         config = AutoConfig.from_pretrained(path)
         config.compress_ratio = args.compress_ratio
         config.important_ratio = args.important_ratio
         config.pp_size = pp_size
         config.sink_size = args.sink_size
+        config.keyformer_mode = (args.keyformer_mode == 1)
         config.drop_ratio = args.drop_ratio
         config.preserve_layer = args.preserve_layer
         config.score_func = args.score_func
@@ -231,27 +278,67 @@ def load_model_and_tokenizer(args, path, model_name, device, pp_size = 1):
         config.n_subvec_per_head = args.n_subvec_per_head
         config.n_subbits = args.n_subbits
         config.topr = args.topr
-        config.gqa = False
+        config.gqa = (args.gqa == "True")
         config.max_iter = args.max_iter
         config.device = torch.device("cuda:0")
+        config.mean_v_trick = (args.sparq_mean_v_trick == "True")
+        config.recent_ratio = args.recent_ratio
         if args.enable_vq_cache:
             config.compress_ratio = args.compress_ratio
             config.important_ratio = args.important_ratio
         elif args.enable_h2o_cache:
             config.hh_ratio = args.important_ratio
-        config.recent_ratio = args.recent_ratio
+        
         if config.compressor == "pq_search":
             config.max_seq_len = 32768
             config.cache_block_size = 128
             config.global_cache_size = 4096
             config.cache_topk = 32
-            initialize_objects(config, model="mistral")
+            initialize_objects(config, model="llama2")
         tokenizer = AutoTokenizer.from_pretrained(path, use_fast=True)
         if args.enable_vq_cache:
             model = VQLlamaForCausalLM.from_pretrained(path, config=config)
         elif args.enable_h2o_cache:
             model = H2OLlamaForCausalLM.from_pretrained(path, config=config)
         model = model.half().eval().to(device)
+    elif "llama" in model_name and "3" in model_name:
+        config = AutoConfig.from_pretrained(path)
+        config.compress_ratio = args.compress_ratio
+        config.important_ratio = args.important_ratio
+        config.pp_size = pp_size
+        config.sink_size = args.sink_size
+        config.keyformer_mode = (args.keyformer_mode == 1)
+        config.drop_ratio = args.drop_ratio
+        config.preserve_layer = args.preserve_layer
+        config.score_func = args.score_func
+        config.compressor = args.compressor
+        config.threshold = args.threshold
+        config.n_subvec_per_head = args.n_subvec_per_head
+        config.n_subbits = args.n_subbits
+        config.topr = args.topr
+        config.gqa = (args.gqa == "True")
+        config.max_iter = args.max_iter
+        config.device = torch.device("cuda:0")
+        config.mean_v_trick = (args.sparq_mean_v_trick == "True")
+        config.recent_ratio = args.recent_ratio
+        if args.enable_vq_cache:
+            config.compress_ratio = args.compress_ratio
+            config.important_ratio = args.important_ratio
+        elif args.enable_h2o_cache:
+            config.hh_ratio = args.important_ratio
+        
+        if config.compressor == "pq_search":
+            config.max_seq_len = 70000
+            config.cache_block_size = 128
+            config.global_cache_size = 4096
+            config.cache_topk = 32
+            initialize_objects(config, model="llama3.1")
+        tokenizer = AutoTokenizer.from_pretrained(path, use_fast=True)
+        if args.enable_vq_cache:
+            model = VQLlama31ForCausalLM.from_pretrained(path, config=config)
+        elif args.enable_h2o_cache:
+            model = H2OLlamaForCausalLM.from_pretrained(path, config=config)
+        model = model.half().eval()
     elif "longchat" in model_name or "vicuna" in model_name:
         from fastchat.model import load_model
         replace_llama_attn_with_flash_attn()
@@ -303,12 +390,14 @@ def get_config_str_list(args):
             f"mode_{args.compressor}",
             f"sink_{args.sink_size}",
         ]
-    elif args.compressor in ["off","vq_h2o","no_drop_lb"]:
-        config_str = [
+    elif args.compressor in ["off","vq_h2o","no_drop_lb","snapkv","h2o"]:
+        config_str = [ 
             f"budget_{args.compress_ratio}",
             f"topk_{args.important_ratio}",
             f"rec_{args.recent_ratio}",
             f"sink_{args.sink_size}",
+            f"gumbel_{args.keyformer_mode}",
+            f"drop_{args.drop_ratio}",
             f"mode_{args.compressor}",
             f"skip_layer_{args.preserve_layer}",
             f"score_{args.score_func}",
@@ -325,19 +414,17 @@ if __name__ == '__main__':
     model2path = json.load(open("config/model2path.json", "r"))
     model2maxlen = json.load(open("config/model2maxlen.json", "r"))
     model_name = args.model
-    # define your model
     max_length = model2maxlen[model_name]
     if args.e:
         datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news",
                     "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
     else:
-        datasets = ["gov_report", "multi_news","hotpotqa","2wikimqa","musique","multifieldqa_en","narrativeqa","qasper"]
+        datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
+                    "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
+                    "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
 
-
-    # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
     dataset2prompt = json.load(open("config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
-    # predict on each dataset
     if not os.path.exists("pred"):
         os.makedirs("pred")
     if not os.path.exists("pred_e"):
@@ -346,13 +433,13 @@ if __name__ == '__main__':
     device = torch.device("cuda:0")
     model, tokenizer = load_model_and_tokenizer(args, model2path[model_name], model_name, device, args.pp_size)
     for dataset in datasets:
+        logger.info(f"Yes we are evaluating {dataset}")
         if args.e:
             data = load_dataset('./data', f"{dataset}_e", split='test')
             if not os.path.exists(f"pred_e/{model_name}"):
                 os.makedirs(f"pred_e/{model_name}")
             out_path = f"pred_e/{model_name}/{dataset}.jsonl"
         else:
-            # data = load_dataset('./data', dataset, split='test')
             data = load_dataset('json', data_files='./data/' +
                                 dataset+'.jsonl', split='train')
             exp_name = args.exp_name
@@ -374,3 +461,5 @@ if __name__ == '__main__':
         
         get_pred(args, model, tokenizer, 0, world_size, data_all, max_length, max_gen,
                     prompt_format, dataset, model_name, model2path, out_path)
+        
+    print("All evaluation done.")

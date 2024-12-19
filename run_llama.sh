@@ -3,11 +3,11 @@ set -x
 # "original", "pq_search", "sparq_f", "infllm", "h2o"
 SEED="4321"
 COMPRESSOR="pq_search" 
-EXP_NAME=default
+EXP_NAME=pq_${SEED}_rerun_v0
 MODE="off" # profile or off 
-DEVICE=4 # GPU index.
-CORE_OFFSET=0 # 64
-COMPRESS=0.2
+DEVICE=0,1
+COMPRESS=0.1
+CORE_OFFSET=100 # 100 160
 TOPK=0.5
 RECENT_RATIO=0.5
 SINK_SIZE=32
@@ -30,13 +30,13 @@ USE_LINGUA=0
 export CORE_OFFSET=${CORE_OFFSET}
 
 RANDOM_SEED=${SEED} \
-PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:64" \
+PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128" \
 CUDA_VISIBLE_DEVICES=${DEVICE} \
 TOKENIZERS_PARALLELISM=false \
 SUBVEC=${SUBVEC} SUBBITS=${SUBBITS} \
 METRIC=${METRIC} \
 python vq_pred.py \
-    --model  mistral-7b-Instruct-32k \
+    --model  llama-3.1 \
     --compress_ratio ${COMPRESS} \
     --important_ratio ${TOPK} \
     --recent_ratio ${RECENT_RATIO} \

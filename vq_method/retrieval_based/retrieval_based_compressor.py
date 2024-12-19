@@ -16,7 +16,6 @@ def unrepeat(a:torch.Tensor, size, dim_idx):
 
 recall_history = []
 
-# 用于比较每个decoding step中，被挑选出来计算attn的tokens与实际上的最高分tokens的重合程度
 def calc_recall(query, key, dummy_topk_indices, num_kv_group, topk_size):
     bsz, kv_head, kv_seq_len, dim = key.shape
     _, n_head, q_len, _ = query.shape
@@ -25,7 +24,7 @@ def calc_recall(query, key, dummy_topk_indices, num_kv_group, topk_size):
     elif key.shape[1] == query.shape[1]:
         real_weight = query @ key.transpose(2,3)
     else:
-        raise Exception("?")
+        raise Exception(f"?{key.shape},{query.shape},{num_kv_group}")
     
     real_topk_indices = real_weight.topk(k = topk_size, dim = -1, largest=True).indices
     assert real_topk_indices.shape == (bsz, n_head, q_len, topk_size)

@@ -19,10 +19,14 @@ Extensive experiments show that PQCache achieves both effectiveness and efficien
 
 ![PQCache](./pqcache.png)
 
+## Environment
+
+We're using Conda to manage the Python environment. Please try building the Conda environment from the `env.yml` file. We install the "flash-attn" package from a downloaded wheel, so if you encounter any errors during installation, please try downloading and installing this package manually.
+
 ## Scripts
 
 1. First compile lfucache for GPU cache:
-```
+```bash
 cd vq_method/retrieval_based/lfu/
 mkdir build; cd build; cmake ..; make
 cd ../../../../
@@ -30,10 +34,25 @@ cd ../../../../
 
 2. Then download the datasets of [LongBench](https://github.com/THUDM/LongBench) to `./data/`.
 
-3. Run the script:
+3. [Optional] If you want to use local model checkpoints, please modify the paths listed in `config/model2path.json`.
+```json
+{
+    "mistral-7b-Instruct-32k": "[MISTRAL_MODEL_PATH]",
+    "llama-3.1": "[LLAMA_MODEL_PATH]"
+}
 ```
+
+4. Run the script:
+```bash
 bash run_mistral.sh
 ```
+
+5. Run the evaluation script after completing the generation of all samples:
+```bash
+python eval.py --model mistral-7b-Instruct-32k --dataset narrativeqa --exp_name default
+# python eval.py --model mistral-7b-Instruct-32k --dataset [DATASET_NAMES] --exp_name [EXP_NAME]
+```
+The evaluation results locate in `pred/mistral-7b-Instruct-32k/narrativeqa/default`.
 
 ## Code Structure
 
@@ -45,6 +64,7 @@ Our codes are mainly in the `vq_method` directory.
     - multi_core_compressor_v2.py: codes for multi-CPU-core compression.
     - pq_search.py: codes for PQ compressor.
 - mistral_patch.py: codes for replacing the original attention in Mistral.
+- llama31_patch.py: codes for replacing the original attention in Llama-3.1.
 ```
 
 

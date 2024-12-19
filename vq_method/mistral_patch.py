@@ -1,12 +1,11 @@
 import math
 import torch
-import numpy as np
 from torch import nn
 from typing import Optional, Tuple
 from transformers.models.mistral.configuration_mistral import MistralConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from typing import List, Optional, Tuple, Union
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers.cache_utils import Cache, DynamicCache
 import matplotlib.pyplot as plt
 import time
 import os
@@ -18,14 +17,22 @@ from transformers.models.mistral.modeling_mistral import (
     MistralModel,
     rotate_half,
     repeat_kv,
+    apply_rotary_pos_emb
 )
-from .vq import *
+from .baseline_compressor import *
 from .flash_attn_with_score import flash_attn_with_score
 from .retrieval_based.pq_search import *
 from .retrieval_based.sparq import *
 from flash_attn import flash_attn_func
+import seaborn as sns
+from loguru import logger
+from .retrieval_based.global_timer import global_timer
 
 __all__ = ["VQMistralForCausalLM", "VQMistralAttention"]
+
+SYNC_TEST_TIME = eval(os.environ.get("SYNC_TEST_TIME","0"))
+if SYNC_TEST_TIME:
+    logger.warning("We are syncing everything to profile decomposed latency.")
 
 def layer2device(idx, layer_cnt):
     gpu_in_use = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
@@ -36,16 +43,6 @@ def get_device(layer:nn.Module):
     for param in layer.parameters():
         return param.device
 
-
-def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
-    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-    cos = cos.squeeze(1).squeeze(0)       # [seq_len, dim]
-    sin = sin.squeeze(1).squeeze(0)       # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    x_embed = (x * cos) + (rotate_half(x) * sin)
-    return x_embed
-
 def MistralAttentionPatch(attn: MistralAttention, config, idx):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
     def forward(
@@ -53,10 +50,12 @@ def MistralAttentionPatch(attn: MistralAttention, config, idx):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        padding_mask: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
         assert bsz == 1, "Do not support bsz > 1 yet."
@@ -65,101 +64,93 @@ def MistralAttentionPatch(attn: MistralAttention, config, idx):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
-        first_time = past_key_value is None
-        position_length = key_states.shape[-2]
-        if not first_time:
-            assert position_ids.nelement() == 1
-            if position_length < position_ids.item() + 1:
-                position_length = position_ids.item() + 1
+        first_time = (position_ids.nelement() != 1)
 
-        cos, sin = self.rotary_emb(value_states, seq_len=position_length)
-        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
-        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
-        
-        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
         if first_time:
             self.seq_cnt += 1
             self.fwd_cnt = 0
 
-        if self.compressor == "original":            
+        if self.compressor == "original":
+
             if past_key_value is not None:
-                key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, None)
 
-            past_key_value = (key_states, value_states) if use_cache else None
-
-            # repeat k/v heads if n_kv_heads < n_heads
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
-
+            
             if self.fwd_cnt <= 0 and self.idx <= 0:
                 print(f"Using naive flash-attn, NO COMPRESSION IS CONVEYED NOW, {os.getpid()}")
+            
+            
             attn_output = flash_attn_func(
                     query_states.transpose(1,2),
                     key_states.transpose(1,2),
                     value_states.transpose(1,2),
                     causal = True
                 ).transpose(1,2)
-        elif self.compressor in ["pq_search", "sparq_f"]: # We need to offload KV to CPU side.
+        elif self.compressor in ["pq_search", "sparq_f"]: 
             if first_time:
-                past_key_value = (key_states, value_states) if use_cache else None
-                attn_output, _ = self.kvcache_quantizer.prefill_attn(query_states, past_key_value)
-                # Use dummy KV cache tensor to avoid modifying calling stack. 
-                past_key_value = (key_states.new_zeros([1]), value_states.new_zeros([1])) 
+                attn_output, _ = self.kvcache_quantizer.prefill_attn(query_states, (key_states, value_states))
+                
+                _,_ = past_key_value.update(key_states[...,:1].clone(), value_states[...,:1].clone(), self.layer_idx, None)
             else:
-                # repeat k/v heads if n_kv_heads < n_heads
-                key_states = repeat_kv(key_states, self.num_key_value_groups)
+                
+                key_states = repeat_kv(key_states, self.num_key_value_groups) 
                 value_states = repeat_kv(value_states, self.num_key_value_groups)
                 attn_output = self.kvcache_quantizer.decoding_attn(
                                                     self.num_key_value_groups, 
                                                     query_states,
                                                     key_states, value_states).to(query_states.dtype)
                 attn_output = attn_output.to(query_states.dtype)
-        else: # KV is always on GPU
-            if past_key_value is not None:
-                key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        else: 
+            assert past_key_value is not None
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, None)
+            kv = (key_states, value_states)
 
-            past_key_value = (key_states, value_states) if use_cache else None
-
-            # repeat k/v heads if n_kv_heads < n_heads
+            
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
             if self.use_flash_attn and first_time:
-                # NOTE: 不要用这个kernel decoding，结果不对.
-                # TODO: prefill时暂不支持attention mask
+                
+                
                 attn_output, score = flash_attn_with_score(query_states, key_states, value_states, \
-                                                            phase="prefill", score_func=self.score_func)
+                                                            phase="prefill", gumbel_adjustment=False, \
+                                                            score_func=self.score_func)
                 score = score.reshape([bsz, self.num_key_value_heads, self.num_key_value_groups, q_len])
-                # for GQA circumstance
+                
                 if self.score_func == "sum":
                     score = score.sum(dim=2)
                 elif self.score_func == "max":
                     score = score.max(dim=2).values
                 else:
                     raise Exception(f"Given score func {self.score_func} do not support yet.")
-                compressed_k, compressed_v, _ = self.kvcache_quantizer.apply(past_key_value, 
-                                                                                        attention_score=score, 
-                                                                                        query_states=query_states)
-
-                past_key_value = (compressed_k, compressed_v)
+                compressed_k, compressed_v, _ = self.kvcache_quantizer.apply(kv, 
+                                                                            attention_score=score, 
+                                                                            query_states=query_states)
             else:
-                attention_mask = None # Currently we only support naive causal inference, so we disable attention mask.
+                attention_mask = None 
                 attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
                 attn_weights = self.kvcache_quantizer.restore(
                     attn_weights, self.num_key_value_groups).to(query_states.dtype)
     
-                # 计算attn_output
+                
                 attn_output = torch.matmul(attn_weights, value_states)
 
-
+          
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -172,17 +163,19 @@ def MistralAttentionPatch(attn: MistralAttention, config, idx):
 
         if not output_attentions:
             attn_weights = None
-
+        
         self.fwd_cnt += 1
+
         return attn_output, attn_weights, past_key_value
 
     attn.forward = types.MethodType(forward, attn)
     attn.use_flash_attn = True
     attn.fwd_cnt = 0
     attn.idx = idx
+    attn.score_func = config.score_func
     attn.compressor = config.compressor
     attn.seq_cnt = -1
-    if config.compressor == "off":
+    if config.compressor == "h2o":
         attn.kvcache_quantizer = KVCacheH2OOfficial(
             config.compress_ratio, 
             config.important_ratio,
@@ -217,6 +210,7 @@ def MistralAttentionPatch(attn: MistralAttention, config, idx):
         if os.environ.get("MODE","off") == "profile":
             raise NotImplementedError("profile mode for Sparq is not done yet.")
         else:
+
             attn.kvcache_quantizer = SparQCompressor(
                 config.compress_ratio,
                 config.recent_ratio,
@@ -239,6 +233,7 @@ def MistralAttentionPatch(attn: MistralAttention, config, idx):
 def MistralDecoderLayerPatch(layer: MistralDecoderLayer, config, layer_idx):
     layer.device = layer2device(layer_idx, config.num_hidden_layers)
     MistralAttentionPatch(layer.self_attn, config, layer_idx)
+    return layer.half()
 
 def PPMistralModelPatch(model: MistralModel, config):
     def forward(
@@ -246,148 +241,100 @@ def PPMistralModelPatch(model: MistralModel, config):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # retrieve input_ids and inputs_embeds
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-        elif input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
-
-        # seq_length_with_past = seq_length
-        # past_key_values_length = 0
-
-        # if past_key_values is not None:
-        #     past_key_values_length = past_key_values[0][0].shape[2]
-        #     seq_length_with_past = seq_length_with_past + past_key_values_length
-
-        if position_ids is None:
-            raise Exception("We assume that position id is not None")
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+        assert inputs_embeds is None
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        padding_mask = None
+        return_legacy_cache = False
+        if use_cache and not isinstance(past_key_values, Cache):  
+            return_legacy_cache = True
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            logger.warning_once(
+                "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
+                "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
+            )
 
-        # NOTE: Disable attention mask in this script since only naive causal inference is supported.
-        # embed positions
-        # if attention_mask is None:
-        #     attention_mask = torch.ones(
-        #         (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
-        #     )
-        # elif 0 in attention_mask:
-        #     padding_mask = attention_mask
+        if cache_position is None or position_ids is None:
+            raise Exception("We don't expect this case to happen")
 
-        # if (
-        #     padding_mask is not None
-        #     and hasattr(self.config, "_flash_attn_2_enabled")
-        #     and self.config._flash_attn_2_enabled
-        # ):
-        #     is_padding_right = padding_mask[:, -1].sum().item() != batch_size
-        #     if is_padding_right:
-        #         raise ValueError(
-        #             "You are attempting to perform batched generation with padding_side='right'"
-        #             " this may lead to unexpected behaviour for Flash Attention version of Mistral. Make sure to "
-        #             " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
-        #         )
-            
-        # NOTE: Disable attention mask in this script since only naive causal inference is supported.
-        # attention_mask = self._prepare_decoder_attention_mask(
-        #     attention_mask,
-        #     (batch_size, seq_length),
-        #     inputs_embeds,
-        #     past_key_values_length,
-        #     sliding_window=self.config.sliding_window,
-        # )
-        attention_mask = None
+        causal_mask = None 
 
         hidden_states = inputs_embeds
 
-        # decoder layers
+        position_embeddings = None 
+
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        next_decoder_cache = () if use_cache else None
+        next_decoder_cache = None
 
         for idx, decoder_layer in enumerate(self.layers):
+            
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            past_key_value = past_key_values[idx] if len(past_key_values) == len(self.layers) else None
             if past_key_value is not None:
                 assert past_key_values[idx][0].device == get_device(decoder_layer)
-
+            
             if hidden_states.device != decoder_layer.device:
                 hidden_states = hidden_states.to(decoder_layer.device)
-            
+
             if position_ids.device != decoder_layer.device:
                 position_ids = position_ids.to(decoder_layer.device)
 
             if attention_mask is not None and attention_mask.device != decoder_layer.device:
                 attention_mask = attention_mask.to(decoder_layer.device)
 
-            # if past_key_value is None and idx == 13:
-            #     torch.cuda.synchronize(layer2device(idx, len(self.layers)))
-            #     a = time.perf_counter()
-
             layer_outputs = decoder_layer(
                 hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_value,
+                past_key_value=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                padding_mask=padding_mask,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
             )
-
-            # if past_key_value is None and idx == 13:
-            #     torch.cuda.synchronize(layer2device(idx, len(self.layers)))
-            #     log2show = f"Per layer prefill time {idx} elapsed:{time.perf_counter() - a}. We invoke CUDA.SYNCH to profile"
-            #     # print(log2show)
-            #     with open(f"./profile_result/profile_perlayer_{os.getpid()}.log","a") as f:
-            #         f.write(f"{layer_outputs[0].shape[-2]},{time.perf_counter() - a}\n")
 
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-        
+
         if hidden_states.device != get_device(self.norm):
             hidden_states = hidden_states.to(get_device(self.norm))
-
         hidden_states = self.norm(hidden_states)
 
-        # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
+        if return_legacy_cache:
+            next_cache = next_cache.to_legacy_cache()
+
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
@@ -397,19 +344,22 @@ def PPMistralModelPatch(model: MistralModel, config):
             attentions=all_self_attns,
         )
 
+
+    model.timer_event_start = torch.cuda.Event(enable_timing=True)
+    model.timer_event_end = torch.cuda.Event(enable_timing=True)
     model.vocab_size = config.vocab_size
     model.forward = types.MethodType(forward, model) 
     model.embed_tokens = model.embed_tokens.to(torch.device("cuda:0"))
 
     for i in range(config.num_hidden_layers):
-        model.layers[i] = model.layers[i].to(layer2device(i, config.num_hidden_layers))
-        MistralDecoderLayerPatch(model.layers[i], config, i)
+        model.layers[i] = MistralDecoderLayerPatch(model.layers[i].to(layer2device(i, config.num_hidden_layers)), config, i)
 
     model.norm = model.norm.to(torch.device(f"cuda:{config.pp_size-1}"))
 
     model.gradient_checkpointing = False
-    # Initialize weights and apply final processing
+    
     model.post_init()
+    return model.half()
 
 class VQMistralForCausalLM(MistralForCausalLM):
     def __init__(self, config):
@@ -417,9 +367,9 @@ class VQMistralForCausalLM(MistralForCausalLM):
         super().__init__(config)
         b = time.perf_counter()
 
-        PPMistralModelPatch(self.model, config)
-        self.lm_head = self.lm_head.to(torch.device(f"cuda:{config.pp_size - 1}"))
-        self.model.embed_tokens = self.model.embed_tokens.to(torch.device("cuda:0"))
+        self.model = PPMistralModelPatch(self.model, config)
+        self.lm_head = self.lm_head.to(torch.device(f"cuda:{config.pp_size - 1}")).half()
+        self.model.embed_tokens = self.model.embed_tokens.to(torch.device("cuda:0")).half()
         self.layer_num = config.num_hidden_layers
         self.kv_head_cnt = config.num_key_value_heads
 
@@ -428,8 +378,11 @@ class VQMistralForCausalLM(MistralForCausalLM):
         self.gen_seq_cnt = 0
         self.prefill_len = 0
 
-        self.timer_perfill_history = dict()
-        self.timer_decoding_history = dict()
+        if SYNC_TEST_TIME:
+            self.begin_event = torch.cuda.Event(enable_timing=True)
+            self.end_event = torch.cuda.Event(enable_timing=True)
+            global_timer.set_start_end_event(self.begin_event, self.end_event)
+
         c = time.perf_counter()
         print(f"Init model from mistral patch, Time elapsed:{c - b}, {b - a}")
         self.gradient_checkpointing = False
@@ -437,28 +390,85 @@ class VQMistralForCausalLM(MistralForCausalLM):
         self.fwd_cnt = 0
         self.post_init()
 
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        **kwargs,
+    ):
+
+        is_decoding = (cache_position.nelement() == 1)
+        
+        if past_key_values is not None:
+            assert inputs_embeds is None
+            if is_decoding:
+                assert input_ids.shape[1] != cache_position.shape[0]  
+                input_ids = input_ids[:, cache_position]
+            else:
+                assert input_ids.shape[1] == cache_position.shape[0]
+
+        
+        if attention_mask is not None and position_ids is None:
+            
+            assert len(attention_mask.shape) == 2 and attention_mask.shape[0] == 1, attention_mask.shape
+            assert attention_mask.nelement() == (cache_position[-1].item()+1), f"{attention_mask.nelement()},{cache_position}"
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        
+        if inputs_embeds is not None and cache_position[0] == 0:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids.contiguous()}  
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+
+        self.fwd_cnt += 1
+        if position_ids.shape[-1] > 1:
+            self.fwd_cnt = 0
         
-        # logger.info(f"Mistral forward count:{self.fwd_cnt}")
-        # self.fwd_cnt += 1
+        if self.fwd_cnt == 29 and SYNC_TEST_TIME:
+            global_timer.set_recording_state(True)
+            self.begin_event.record()
+        else:
+            global_timer.set_recording_state(False)
 
         outputs = self.model(
             input_ids=input_ids,
@@ -470,36 +480,32 @@ class VQMistralForCausalLM(MistralForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        
+        
+        logits = self.lm_head(hidden_states[:,-1:,:])
         logits = logits.float()
 
         loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
         
-        # transformers自动在gpu0上做greedy search，这里是一个work around
+        
         loss = loss.to(torch.device(f"cuda:0")) if loss is not None else None
         if outputs.hidden_states is not None:
             outputs.hidden_states = outputs.hidden_state.to(torch.device(f"cuda:0"))
         logits = logits.to(torch.device(f"cuda:0"))
         if outputs.attentions is not None:
             outputs.attentions = outputs.attentions.to(torch.device(f"cuda:0"))
+
+        if self.fwd_cnt == 29 and SYNC_TEST_TIME:
+            self.end_event.record()
+
 
         return CausalLMOutputWithPast(
             loss=loss,
