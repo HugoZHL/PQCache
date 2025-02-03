@@ -1,6 +1,6 @@
-# PQCache: Product Quantization-based KVCache for Long Context LLM Inference ([Paper](https://arxiv.org/abs/2407.12820))
+# [SIGMOD'25] PQCache: Product Quantization-based KVCache for Long Context LLM Inference ([Paper](https://arxiv.org/abs/2407.12820))
 
-Codes for the paper "PQCache: Product Quantization-based KVCache for Long Context LLM Inference".
+Codes for the SIGMOD 2025 paper "PQCache: Product Quantization-based KVCache for Long Context LLM Inference".
 
 
 ## Overview
