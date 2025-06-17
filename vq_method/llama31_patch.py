@@ -12,8 +12,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaForCausalLM,
     LlamaDecoderLayer,
     LlamaModel,
-    repeat_kv,
-    apply_rotary_pos_emb
+    repeat_kv
 )
 from .baseline_compressor import *
 from .flash_attn_with_score import flash_attn_with_score
@@ -23,6 +22,21 @@ from flash_attn import flash_attn_func
 import seaborn as sns
 from loguru import logger
 
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    x = (q * cos)
+    # y = (rotate_half(q) * sin)
+    q_embed = x.add_(rotate_half(q).mul_(sin))
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 def layer2device(idx, layer_cnt):
     gpu_in_use = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
