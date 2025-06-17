@@ -287,7 +287,7 @@ class PqBasedSearchCompressor(RetrievalBasedCompressor):
         self.kv_cache_cnt = np.zeros([bsz*kv_heads], dtype=np.int64)
         self.past_token_cnt = key_states.shape[-2]
         
-        self.gpu_key_for_recall_check = key_states
+        # self.gpu_key_for_recall_check = key_states
         
         return attn_output, self.kv_cache_cnt
 

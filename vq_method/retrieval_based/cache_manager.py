@@ -171,8 +171,10 @@ class GPUCacheManager:
             self.total_budget = self.topk_size + self.sink_size + self.local_size + 1 # the last "1" for current new generated token
             
             # Compute buffer. It carrys tokens which are going to participate attention computation.
-            self.key_buffer = self.global_key_cache.new_empty([self.layer_cnt, 1, self.n_kv_head, self.total_budget, self.dim])
-            self.value_buffer = self.global_key_cache.new_empty([self.layer_cnt, 1, self.n_kv_head, self.total_budget, self.dim])
+            self.key_buffer = self.global_key_cache.new_empty([self.layer_cnt, 1, self.n_kv_head, self.topk_index, self.dim])
+            self.value_buffer = self.global_key_cache.new_empty([self.layer_cnt, 1, self.n_kv_head, self.topk_index, self.dim])
+            self.k = self.global_key_cache.new_empty([1, self.n_kv_head, self.total_budget, self.dim])
+            self.v = self.k.clone()
 
             self.local_to_evict_idx = 0
             self.offloaded_cnt = self.global_token_cnt
@@ -199,7 +201,7 @@ class GPUCacheManager:
         self.value_buffer[layer_idx,:,:,:self.local_size,:].copy_(value[...,-self.local_size:,:], non_blocking=True)
         self.key_buffer[layer_idx,:,:,self.local_size : self.sink_size + self.local_size,:].copy_(key[...,:self.sink_size,:], non_blocking=True)
         self.value_buffer[layer_idx,:,:,self.local_size : self.sink_size + self.local_size,:].copy_(value[...,:self.sink_size,:], non_blocking=True)
-            
+        
         with torch.cuda.stream(self.D2HStream):
             self.kv_ready_events[layer_idx].wait(self.D2HStream)
             
@@ -286,11 +288,14 @@ class GPUCacheManager:
         selected_key = self.cpu_key_buffers[layer_idx].gather(1, indices[...,None].expand([1, -1, -1, 128]))
         selected_value = self.cpu_value_buffer[layer_idx].gather(1, indices[...,None].expand([1, -1, -1, 128]))
 
-        self.key_buffer[layer_idx,:,:,self.topk_index:-1,:] = selected_key.to(self.key_buffer.device).transpose(1,2)
-        self.value_buffer[layer_idx,:,:,self.topk_index:-1,:] = selected_value.to(self.value_buffer.device).transpose(1,2)
+        # Optimize memory usage
+        self.k[...,:self.topk_index,:].copy_(self.key_buffer[layer_idx], non_blocking=True)
+        self.v[...,:self.topk_index,:].copy_(self.value_buffer[layer_idx], non_blocking=True)
+        self.k[...,self.topk_index:-1,:] = selected_key.to(self.key_buffer.device).transpose(1,2)
+        self.v[...,self.topk_index:-1,:] = selected_value.to(self.value_buffer.device).transpose(1,2)
 
-        return self.key_buffer[layer_idx], self.value_buffer[layer_idx]
-        
+        return self.k, self.v
+
     def fetch_and_concat_kv_w_cache(self, indices:torch.Tensor, layer_idx):
         layer_idx = layer_idx % self.layer_cnt
         assert indices.shape == (self.n_kv_head, self.topk_size), f"{indices.shape}, {self.n_kv_head}, {self.topk_size}"
@@ -298,6 +303,10 @@ class GPUCacheManager:
         
         if np.random.randint(0, 10000) % 5000 == 1:
             logger.info("Using pq_search w cache.")
+        
+        # Optimize memory usage
+        self.k[...,:self.topk_index,:].copy_(self.key_buffer[layer_idx], non_blocking=True)
+        self.v[...,:self.topk_index,:].copy_(self.value_buffer[layer_idx], non_blocking=True)
         
         self.cache_update_events[layer_idx].wait()
         
@@ -322,9 +331,9 @@ class GPUCacheManager:
             
             hit_scatter_index = torch.concat([self.hit_scatter_idx_table[self.topk_size*h:self.topk_size*h + hit_cnt[h]] for h in range(self.n_kv_head)], dim=0)
             # Scatter "on gpu" tokens into compute buffer.
-            self.key_buffer[layer_idx].view([self.n_kv_head * self.total_budget, self.dim]) \
+            self.k.view([self.n_kv_head * self.total_budget, self.dim]) \
                             .scatter_(-2, hit_scatter_index.unsqueeze(-1).expand_as(selected_global_key), selected_global_key)
-            self.value_buffer[layer_idx].view([self.n_kv_head * self.total_budget, self.dim]) \
+            self.v.view([self.n_kv_head * self.total_budget, self.dim]) \
                             .scatter_(-2, hit_scatter_index.unsqueeze(-1).expand_as(selected_global_value), selected_global_value)
             
             fetched_token_cnt = to_fetch_idx[1].numel()
@@ -346,9 +355,10 @@ class GPUCacheManager:
 
             miss_scatter_index = torch.concat([self.miss_scatter_idx_table[self.topk_size*h:self.topk_size*h + miss_cnt[h]] for h in range(self.n_kv_head)], dim=0)
             # Scatter "not on gpu" tokens into compute buffer.
-            self.key_buffer[layer_idx].view([self.n_kv_head * self.total_budget, self.dim]) \
+
+            self.k.view([self.n_kv_head * self.total_budget, self.dim]) \
                             .scatter_(-2, miss_scatter_index.unsqueeze(-1).expand_as(fetch_global_key), fetch_global_key)
-            self.value_buffer[layer_idx].view([self.n_kv_head * self.total_budget, self.dim]) \
+            self.v.view([self.n_kv_head * self.total_budget, self.dim]) \
                             .scatter_(-2, miss_scatter_index.unsqueeze(-1).expand_as(fetch_global_value), fetch_global_value)
 
             old_cache_buf_pos = torch.gather(self.block_pos_record[layer_idx, 0], -1, qualified_block_idx).tolist()
@@ -412,7 +422,7 @@ class GPUCacheManager:
             indices = indices.unsqueeze(0).unsqueeze(3).expand([1, self.n_kv_head, self.topk_size, self.dim])
             to_fetch_key = torch.gather(self.cpu_key_buffers[layer_idx].transpose(1,2), dim = 2, index=indices)
             to_fetch_value = torch.gather(self.cpu_value_buffer[layer_idx].transpose(1,2), dim = 2, index=indices)
-
-            self.key_buffer[layer_idx, :,:,-self.topk_size-1:-1].copy_(to_fetch_key, non_blocking=True)
-            self.value_buffer[layer_idx, :,:,-self.topk_size-1:-1].copy_(to_fetch_value, non_blocking=True)    
-        return self.key_buffer[layer_idx], self.value_buffer[layer_idx]
+            self.k[...,-self.topk_size-1:-1].copy_(to_fetch_key, non_blocking=True)
+            self.v[...,-self.topk_size-1:-1].copy_(to_fetch_value, non_blocking=True)    
+        
+        return self.k, self.v

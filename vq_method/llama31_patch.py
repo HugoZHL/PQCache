@@ -234,6 +234,63 @@ def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
 
     
 def LlamaDecoderLayerPatch(layer: LlamaDecoderLayer, config, layer_idx):
+    def forward(self,
+                hidden_states: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_value: Optional[Cache] = None,
+                output_attentions: Optional[bool] = False,
+                use_cache: Optional[bool] = False,
+                cache_position: Optional[torch.LongTensor] = None,
+                position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+                **kwargs,):
+
+        residual = hidden_states.clone()
+        batch, seq_len, embed_dim = hidden_states.shape
+        # hidden_states = self.input_layernorm(hidden_states)
+        for start_idx in range(0, seq_len, 32000):
+            end_idx = min(seq_len, start_idx + 32000)
+            hidden_states[:, start_idx:end_idx, :] = self.input_layernorm(
+                hidden_states[:, start_idx:end_idx, :]
+            )
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        
+        # hidden_states = residual + hidden_states
+        hidden_states.add_(residual)
+        del(residual)
+        
+        # hidden_states = residual + hidden_states
+        n_chunks = math.ceil(seq_len / 32000)
+        avg_chunk_size = math.ceil(seq_len // n_chunks)
+        for start_idx in range(0, seq_len, avg_chunk_size):
+            end_idx = min(seq_len, start_idx + avg_chunk_size)
+            part_hidden_states = hidden_states[:, start_idx:end_idx, :].clone()
+            part_hidden_states = self.post_attention_layernorm(part_hidden_states)
+            part_hidden_states = self.mlp(part_hidden_states)
+            hidden_states[:, start_idx:end_idx, :] += part_hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+        return outputs
+
+    layer.forward = types.MethodType(forward, layer)
     layer.device = layer2device(layer_idx, config.num_hidden_layers)
     LlamaAttentionPatch(layer.self_attn, config, layer_idx)
     return layer.half()
