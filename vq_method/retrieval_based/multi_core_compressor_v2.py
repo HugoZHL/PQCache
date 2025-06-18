@@ -260,7 +260,7 @@ class MultiCoreCompressor_v2:
                                     max_cent_cnt = max_cent_cnt,
                                     max_seq_len = max_seq_len,
                                     dim = dim, 
-                                    max_size = 32
+                                    max_size = layer_cnt
                                     )
         
         self.shm_pool.init_sync_tools()
@@ -444,7 +444,9 @@ class MultiCoreCompressor_v2:
         for queue in self.queues:
             queue.put((shm_set_idx, (n_groups, n_xb, input_dim), cent_cnt, max_iter, is_profiling))
     
-    def wait_for_km_result(self, shm_set_idx):
+    def wait_for_km_result(self, shm_set_idx=None):
+        if shm_set_idx is None:
+            shm_set_idx = len(self.shm_pool.shared_mem_block_sets) - 1
         done = self.shm_pool.shared_mem_block_sets[shm_set_idx].km_task_event.is_set()
         if not done:
             while not self.shm_pool.shared_mem_block_sets[shm_set_idx].km_task_event.wait(timeout=2):

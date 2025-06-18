@@ -263,7 +263,7 @@ def load_model_and_tokenizer(args, path, model_name, device, pp_size = 1):
         
         model = VQMistralForCausalLM.from_pretrained(path, config=config)
         model = model.half().eval()
-    elif "llama" in model_name and "2" in model_name:
+    elif "llama" in model_name and "2." in model_name:
         config = AutoConfig.from_pretrained(path)
         config.compress_ratio = args.compress_ratio
         config.important_ratio = args.important_ratio
@@ -294,14 +294,14 @@ def load_model_and_tokenizer(args, path, model_name, device, pp_size = 1):
             config.cache_block_size = 128
             config.global_cache_size = 4096
             config.cache_topk = 32
-            initialize_objects(config, model="llama2")
+            initialize_objects(config, model=model_name)
         tokenizer = AutoTokenizer.from_pretrained(path, use_fast=True)
         if args.enable_vq_cache:
             model = VQLlamaForCausalLM.from_pretrained(path, config=config)
         elif args.enable_h2o_cache:
             model = H2OLlamaForCausalLM.from_pretrained(path, config=config)
         model = model.half().eval().to(device)
-    elif "llama" in model_name and "3" in model_name:
+    elif "llama" in model_name and "3." in model_name:
         config = AutoConfig.from_pretrained(path)
         config.compress_ratio = args.compress_ratio
         config.important_ratio = args.important_ratio
@@ -332,7 +332,7 @@ def load_model_and_tokenizer(args, path, model_name, device, pp_size = 1):
             config.cache_block_size = 128
             config.global_cache_size = 4096
             config.cache_topk = 32
-            initialize_objects(config, model="llama3.1")
+            initialize_objects(config, model=model_name)
         tokenizer = AutoTokenizer.from_pretrained(path, use_fast=True)
         if args.enable_vq_cache:
             model = VQLlama31ForCausalLM.from_pretrained(path, config=config)

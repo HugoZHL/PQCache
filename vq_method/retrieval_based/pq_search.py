@@ -66,54 +66,25 @@ def initialize_objects(config, model):
         offload_events += cache_manager.offload_events
 
     # Assume that we utilize 64 cpu cores.
-    if "mistral" in model or "Mistral" in model:
-        process_cnt = min(8 * eval(os.environ.get("SUBVEC",2)), MAX_WORKER_CNT)
-        global_compressor = MultiCoreCompressor_v2(cpu_key_bufs,
-                                                   offload_events,
-                                                   process_cnt = process_cnt,
-                                                    core_per_process = MAX_CPU_IN_USE // process_cnt, 
-                                                    max_km_groups=8 * eval(os.environ.get("SUBVEC",2)),
-                                                    max_seq_len=config.max_seq_len,
-                                                    dim=128 // eval(os.environ.get("SUBVEC",2)),
-                                                    max_cent_cnt= 2 ** eval(os.environ.get("SUBBITS","6")),
-                                                    max_task_cnt=32,
-                                                    metric=os.environ.get("METRIC","euc"),
-                                                    layer_cnt = config.num_hidden_layers,
-                                                    model_name=model)
-    elif ("llama" in model or "Llama" in model) and "2" in model:
-        process_cnt = min(32 * eval(os.environ.get("SUBVEC",2)), MAX_WORKER_CNT)
-        global_compressor = MultiCoreCompressor_v2(cpu_key_bufs,
-                                                    offload_events,
-                                                    process_cnt=process_cnt,
-                                                    core_per_process = MAX_CPU_IN_USE // process_cnt, 
-                                                    max_km_groups = 32 * eval(os.environ.get("SUBVEC",2)),
-                                                    max_seq_len=config.max_seq_len,
-                                                    dim=128 // eval(os.environ.get("SUBVEC",2)),
-                                                    max_cent_cnt= 2 ** eval(os.environ.get("SUBBITS","6")),
-                                                    max_task_cnt=32,
-                                                    metric=os.environ.get("METRIC","euc"),
-                                                    layer_cnt=config.num_hidden_layers,
-                                                    model_name=model)
-    elif ("llama" in model or "Llama" in model) and "3" in model:
-        process_cnt = min(8 * eval(os.environ.get("SUBVEC",2)), MAX_WORKER_CNT)
-        global_compressor = MultiCoreCompressor_v2(cpu_key_bufs,
-                                                   offload_events,
-                                                   process_cnt = process_cnt,
-                                                    core_per_process = MAX_CPU_IN_USE // process_cnt, 
-                                                    max_km_groups=8 * eval(os.environ.get("SUBVEC",2)),
-                                                    max_seq_len=config.max_seq_len,
-                                                    dim=128 // eval(os.environ.get("SUBVEC",2)),
-                                                    max_cent_cnt= 2 ** eval(os.environ.get("SUBBITS","6")),
-                                                    max_task_cnt=32,
-                                                    metric=os.environ.get("METRIC","euc"),
-                                                    layer_cnt = config.num_hidden_layers,
-                                                    model_name=model)
+    process_cnt = min(config.num_key_value_heads  * eval(os.environ.get("SUBVEC",2)), MAX_WORKER_CNT)
+    global_compressor = MultiCoreCompressor_v2(cpu_key_bufs,
+                                                offload_events,
+                                                process_cnt = process_cnt,
+                                                core_per_process = MAX_CPU_IN_USE // process_cnt, 
+                                                max_km_groups=config.num_key_value_heads * eval(os.environ.get("SUBVEC",2)),
+                                                max_seq_len=config.max_seq_len,
+                                                dim=(config.hidden_size // config.num_attention_heads) // eval(os.environ.get("SUBVEC",2)),
+                                                max_cent_cnt= 2 ** eval(os.environ.get("SUBBITS","6")),
+                                                max_task_cnt=32,
+                                                metric=os.environ.get("METRIC","euc"),
+                                                layer_cnt = config.num_hidden_layers,
+                                                model_name=model)
 
     logger.info("Multi-core compressor init done.")
 
 def wait():
     global global_compressor
-    global_compressor.wait_for_km_result(31)
+    global_compressor.wait_for_km_result()
 
 def del_objects():
     global global_compressor
