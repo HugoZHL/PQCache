@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 3.0)
 aux_source_directory(src CACHE_SRC_LIST)
 
 find_package(pybind11 2.6.0 CONFIG)
