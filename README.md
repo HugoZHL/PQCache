@@ -20,7 +20,7 @@ Extensive experiments show that PQCache achieves both effectiveness and efficien
 ![PQCache](./pqcache.png)
 
 ## Environment
-We're using Conda to manage the Python environment. Execute commands below to setup.
+Our python environment management is based on miniconda3. After installing miniconda3, execute commands below to setup.
 ```bash
 conda create -n pqcache python=3.10
 conda activate pqcache
