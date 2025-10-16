@@ -20,9 +20,16 @@ Extensive experiments show that PQCache achieves both effectiveness and efficien
 ![PQCache](./pqcache.png)
 
 ## Environment
+We're using Conda to manage the Python environment. Execute commands below to setup.
+```bash
+conda create -n pqcache python=3.10
+conda activate pqcache
 
-We're using Conda to manage the Python environment. Please try building the Conda environment from the `env.yml` file. We install the "flash-attn" package from a downloaded wheel, so if you encounter any errors during installation, please try downloading and installing this package manually.
-
+pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+# We install the "flash-attn" package from a downloaded wheel
+wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.8/flash_attn-2.5.8+cu122torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+pip install -r requirements.txt
+```
 Current implementation of PQCache requires that the GPU's Compute Capability $\ge$ 80 (A100, A800, RTX4090, L40s, H100, H20, etc.) and the memory size $\ge$ 24G. We have tested and verified that PQCache can run on A800 and RTX4090.
 
 ## Models
