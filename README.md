@@ -28,6 +28,7 @@ conda activate pqcache
 pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu121
 # We install the "flash-attn" package from a downloaded wheel
 wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.8/flash_attn-2.5.8+cu122torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+pip install flash_attn-2.5.8+cu122torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 pip install -r requirements.txt
 ```
 Current implementation of PQCache requires that the GPU's Compute Capability $\ge$ 80 (A100, A800, RTX4090, L40s, H100, H20, etc.) and the memory size $\ge$ 24G. We have tested and verified that PQCache can run on A800 and RTX4090.
@@ -45,8 +46,13 @@ cd ../../../../
 ```
 
 2. Then download the datasets of [LongBench](https://github.com/THUDM/LongBench) to `./data/`.
+```bash
+# You could simply use this link to download the data.
+wget https://huggingface.co/datasets/zai-org/LongBench/resolve/main/data.zip?download=true
+```
+(Our experiment is based on LongBench v1)
 
-3. [Optional] If you want to use local model checkpoints, please modify the paths listed in `config/model2path.json`.
+4. [Optional] If you want to use local model checkpoints, please modify the paths listed in `config/model2path.json`.
 ```json
 {
     "mistral-7b-Instruct-32k": "[MISTRAL_MODEL_PATH]",
