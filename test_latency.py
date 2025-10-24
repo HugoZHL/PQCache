@@ -16,14 +16,16 @@ from vq_method.retrieval_based.global_timer import global_timer
 
 SYNC_TEST_TIME = eval(os.environ.get("SYNC_TEST_TIME","0"))
 
-# NOTE: We use Llama2-7b to benchmark the latency.
-
 def main():
-    model_path = "./pqcache/mistral-7b-Instruct-32k"
+    # model_path = "./pqcache/mistral-7b-Instruct-32k"
+    model_path = "[MODEL_PATH]"
     print("Using mistral to profile")
     # print("Testing latency, make sure you are using llama3.1 model")
-    
-    config = AutoConfig.from_pretrained(model_path)
+    try:
+        config = AutoConfig.from_pretrained(model_path)
+    except:
+        raise Exception(f"Cannot find the model parameters directory: {model_path}")
+
     config.compress_ratio = 0.2
     config.recent_ratio = 0.5
     config.important_ratio = 0.5
