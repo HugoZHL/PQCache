@@ -35,7 +35,7 @@ def initialize_objects(config, model):
     global H2DStream
     H2DStream = torch.cuda.Stream()
     
-    MAX_CPU_IN_USE=64
+    MAX_CPU_IN_USE=int(eval(os.environ.get("MAX_CPU_IN_USE", "32")))
     MAX_WORKER_CNT=64
 
     cache_managers = []
