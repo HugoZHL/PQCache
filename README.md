@@ -68,10 +68,22 @@ bash run_mistral.sh
 5. Run the evaluation script after completing the generation of all samples:
 ```bash
 python eval.py --model mistral-7b-Instruct-32k --dataset narrativeqa --exp_name default
-# python eval.py --model mistral-7b-Instruct-32k --dataset [DATASET_NAMES] --exp_name [EXP_NAME]
+# python eval.py --model mistral-7b-Instruct-32k --dataset [DATASET_NAMES,] --exp_name [EXP_NAME]
 ```
 The evaluation results locate in `pred/mistral-7b-Instruct-32k/narrativeqa/default`.
 
+You could also evaluate on multiple tasks by executing:
+```bash
+# For example, evaluate on [narrativeqa, qasper, trec].
+python eval.py --model mistral-7b-Instruct-32k --dataset narrativeqa qasper trec --exp_name default
+
+# Gather the results of multiple tasks
+python parse_result.py \
+--model mistral-7b-Instruct-32k \
+--result_path pred \
+--exp_name default \
+--output_path default.json
+```
 ## Code Structure
 
 Our codes are mainly in the `vq_method` directory.
