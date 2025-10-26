@@ -3,7 +3,7 @@ set -x
 # "original", "pq_search", "sparq_f", "infllm", "h2o"
 SEED="4321"
 COMPRESSOR="pq_search" 
-EXP_NAME=pq_${SEED}_rerun_v0
+EXP_NAME=default
 MODE="off" # profile or off 
 DEVICE=0
 COMPRESS=0.1

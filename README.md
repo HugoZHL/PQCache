@@ -48,7 +48,7 @@ cd ../../../../
 2. Then download the datasets of [LongBench](https://github.com/THUDM/LongBench) to `./data/`.
 ```bash
 # You could simply use this link to download the data.
-wget https://huggingface.co/datasets/zai-org/LongBench/resolve/main/data.zip?download=true
+wget https://huggingface.co/datasets/zai-org/LongBench/resolve/main/data.zip
 ```
 (Our experiment is based on LongBench v1)
 
@@ -62,24 +62,25 @@ wget https://huggingface.co/datasets/zai-org/LongBench/resolve/main/data.zip?dow
 
 4. Run the script:
 ```bash
-bash run_mistral.sh
+bash run_llama.sh
 ```
 
 5. Run the evaluation script after completing the generation of all samples:
 ```bash
-python eval.py --model mistral-7b-Instruct-32k --dataset narrativeqa --exp_name default
-# python eval.py --model mistral-7b-Instruct-32k --dataset [DATASET_NAMES,] --exp_name [EXP_NAME]
+python eval.py --model llama-3.1 --dataset narrativeqa --exp_name default
+# python eval.py --model llama-3.1 --dataset [DATASET_NAMES,] --exp_name [EXP_NAME]
 ```
-The evaluation results locate in `pred/mistral-7b-Instruct-32k/narrativeqa/default`.
+The evaluation results locate in `pred/llama-3.1/narrativeqa/default`(corresponding to the results in Table 2 of the paper).
+
 
 You could also evaluate on multiple tasks by executing:
 ```bash
 # For example, evaluate on [narrativeqa, qasper, trec].
-python eval.py --model mistral-7b-Instruct-32k --dataset narrativeqa qasper trec --exp_name default
+python eval.py --model llama-3.1 --dataset narrativeqa qasper trec --exp_name default
 
 # Gather the results of multiple tasks
 python parse_result.py \
---model mistral-7b-Instruct-32k \
+--model llama-3.1 \
 --result_path pred \
 --exp_name default \
 --output_path default.json
