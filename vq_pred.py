@@ -13,7 +13,7 @@ from vq_method.llama31_patch import VQLlama31ForCausalLM
 
 from vq_method.mistral_patch import VQMistralForCausalLM
 from h2o_method.h2o_attention import H2OLlamaForCausalLM, H2OLlamaAttention
-from vq_method.retrieval_based.pq_search import initialize_objects
+from vq_method.retrieval_based.pq_search import initialize_objects, del_objects
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -468,3 +468,4 @@ if __name__ == '__main__':
                     prompt_format, dataset, model_name, model2path, out_path)
         
     print("All evaluation done.")
+    del_objects()
