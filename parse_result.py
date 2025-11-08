@@ -6,7 +6,7 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--result_path', type=str)
     parser.add_argument('--model', type=str, default="mistral-7b-Instruct-32k", 
-                        choices=["llama-7b", "mistral-7b-Instruct-32k", "longchat-v1.5-7b-32k",
+                        choices=["llama-7b", "mistral-7b-Instruct-32k", "longchat-v1.5-7b-32k", "llama-3.1",
                         "xgen-7b-8k", "internlm-7b-8k", "chatglm2-6b", "chatglm2-6b-32k", "chatglm3-6b-32k", "vicuna-v1.5-7b-16k"])
     parser.add_argument('--exp_name', type=str)
     parser.add_argument('--output_path', type=str)

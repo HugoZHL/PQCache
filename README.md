@@ -52,7 +52,7 @@ wget https://huggingface.co/datasets/zai-org/LongBench/resolve/main/data.zip
 ```
 (Our experiment is based on LongBench v1)
 
-4. [Optional] If you want to use local model checkpoints, please modify the paths listed in `config/model2path.json`.
+3. [Optional] If you want to use local model checkpoints, please modify the paths listed in `config/model2path.json`. Note: Downloading the Llama-3.1 model requires huggingface authentication. Please refer to the content in the [link](https://huggingface.co/docs/hub/models-gated#access-gated-models-as-a-user).
 ```json
 {
     "mistral-7b-Instruct-32k": "[MISTRAL_MODEL_PATH]",
