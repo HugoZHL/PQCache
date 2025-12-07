@@ -62,6 +62,8 @@ wget https://huggingface.co/datasets/zai-org/LongBench/resolve/main/data.zip
 
 4. Run the script:
 ```bash
+# Please modify certain environment variables in the script according to your environment.
+# Such as CUDA_VISIBLE_DEVICES
 bash run_llama.sh
 ```
 In the default configuration, we use 48 CPU cores for clustering computations. You could modify the ```MAX_CPU_IN_USE``` in run_llama.sh to adapt to the runtime environment.
