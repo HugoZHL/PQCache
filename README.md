@@ -64,6 +64,9 @@ wget https://huggingface.co/datasets/zai-org/LongBench/resolve/main/data.zip
 ```bash
 bash run_llama.sh
 ```
+In the default configuration, we use 48 CPU cores for clustering computations. You could modify the ```MAX_CPU_IN_USE``` in run_llama.sh to adapt to the runtime environment.
+
+We recommend setting ```MAX_CPU_IN_USE``` to a multiple of the product of the model’s ```n_kv_head```(e.g., 8 for Llama3.1) and ```SUBVEC```(e.g., 2).
 
 5. Run the evaluation script after completing the generation of all samples:
 ```bash
