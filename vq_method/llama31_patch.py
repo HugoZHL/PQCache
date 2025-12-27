@@ -109,9 +109,7 @@ def LlamaAttentionPatch(attn: LlamaAttention, config, idx):
                 print(f"Using naive flash-attn, NO COMPRESSION IS CONVEYED NOW, {os.getpid()}")
             
             
-            # TODO: 这里的Decoding能否换成varlen_func来加速？
-
-            # TODO: 这里的Decoding能否换成varlen_func来加速？
+            # TODO: Can decoding here be replaced with varlen_func for speedup?
             attn_output = flash_attn_func(
                     query_states.transpose(1,2),
                     key_states.transpose(1,2),

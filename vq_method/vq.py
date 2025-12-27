@@ -1,36 +1,69 @@
+"""
+Vector Quantization (VQ) based KV-cache compression.
+
+This module provides H2O (Heavy-Hitter Oracle) based compression strategies
+for KV-cache management in LLM inference.
+"""
+
+from typing import List, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
-from kmeans_gpu import KMeans  # try kmeans on GPU
-from typing import Optional, List, Tuple
-import numpy as np
+from kmeans_gpu import KMeans  # GPU-accelerated k-means
 
-def repeat(a, size, dim_idx):
-    shape = a.shape
-    return a.unsqueeze(dim_idx+1) \
-            .expand(*shape[:dim_idx], shape[dim_idx], size, *shape[dim_idx+1:]) \
-            .reshape(*shape[:dim_idx], shape[dim_idx] * size, *shape[dim_idx+1:])
-
-def unrepeat(a, size, dim_idx):
-    shape = a.shape
-    return a.reshape(*shape[:dim_idx], shape[dim_idx] // size, size, *shape[dim_idx+1:]) \
-            .select(dim_idx+1, 0) \
-            .squeeze(dim_idx+1)
+from .utils import repeat, unrepeat
 
 class KVCacheH2O(object):
-    def __init__(self, compress_ratio, h2o_ratio, recent_ratio, drop_ratio, sink_size = 0, show_hit_rate = True):
+    """
+    H2O (Heavy-Hitter Oracle) based KV-cache compressor.
+
+    This compressor identifies and retains important tokens based on
+    accumulated attention scores, combining heavy-hitter tokens with
+    recent tokens and sink tokens (initial tokens that models rely on).
+
+    Attributes:
+        compress_ratio: Target compression ratio (fraction of tokens to keep).
+        h2o_ratio: Fraction of budget for heavy-hitter (high attention) tokens.
+        recent_ratio: Fraction of budget for recent tokens.
+        sink_size: Number of initial tokens to always preserve.
+        drop_ratio: Fraction of low-attention tokens to ignore during VQ.
+        show_hit_rate: Whether to track and display hit rate metrics.
+    """
+
+    def __init__(
+        self,
+        compress_ratio: float,
+        h2o_ratio: float,
+        recent_ratio: float,
+        drop_ratio: float,
+        sink_size: int = 0,
+        show_hit_rate: bool = True
+    ):
+        """
+        Initialize the H2O compressor.
+
+        Args:
+            compress_ratio: Target compression ratio (0-1).
+            h2o_ratio: Fraction of compressed budget for heavy-hitters.
+            recent_ratio: Fraction of compressed budget for recent tokens.
+            drop_ratio: Fraction of low-attention tokens to ignore during VQ.
+            sink_size: Number of initial "sink" tokens to always preserve.
+            show_hit_rate: Whether to track original KV for hit rate calculation.
+        """
         print("Initing KV Cache H2O compressor")
         self.compress_ratio = compress_ratio
         self.h2o_ratio = h2o_ratio
         self.recent_ratio = recent_ratio
         self.sink_size = sink_size
-        # VQ时忽略一定比例的低attn score tokens。
-        self.drop_ratio = drop_ratio 
+        # Ignore a certain proportion of low attention score tokens during VQ.
+        self.drop_ratio = drop_ratio
         self._current_nclus = 0
         self._current_indices = None
         self.show_hit_rate = show_hit_rate
 
-        self.previous_scores = None
-        self.attention_masks_next = None
+        self.previous_scores: Optional[torch.Tensor] = None
+        self.attention_masks_next: Optional[torch.Tensor] = None
 
     def apply(
         self,
@@ -86,7 +119,7 @@ class KVCacheH2O(object):
 
     def restore(
         self,
-        attn_weights: torch.Tensor, # 调用时已除以温度
+        attn_weights: torch.Tensor,  # Already divided by temperature when called
         num_key_value_groups: int,
     ):
         # Eviction...
@@ -143,7 +176,7 @@ class KVCacheH2OOfficial:
             # activate most recent k-cache
             if not self.recent_budget == 0:
                 attn_mask[:, self.sink_size:-self.recent_budget] = 0
-                selected_set = self.previous_scores[:, self.sink_size:-self.recent_budget] # recent token不参与evict
+                selected_set = self.previous_scores[:, self.sink_size:-self.recent_budget]  # Recent tokens don't participate in eviction
             else:
                 # activate historical best self.cache_budget - self.recent_budget tokens.
                 # self.previous_scores # (k-Cache - 1)
@@ -198,7 +231,7 @@ class KVCacheH2OOfficial:
             # activate most recent k-cache
             if not self.recent_budget == 0:
                 attn_mask[:, self.sink_size:-self.recent_budget] = 0
-                selected_set = self.previous_scores[:, self.sink_size:-self.recent_budget] # recent token不参与evict
+                selected_set = self.previous_scores[:, self.sink_size:-self.recent_budget]  # Recent tokens don't participate in eviction
             else:
                 # activate historical best self.cache_budget - self.recent_budget tokens.
                 # self.previous_scores # (k-Cache - 1)
@@ -234,8 +267,8 @@ class fullKVLimitBasedCompressor(object):
         print(f"Initializing oracle compressor, GQA mode:{self.GQA}")
         self.fwd_cnt = 0
 
-    # 观察通过prefill阶段h2o策略挑出来的token，在decoding时是否还保持重要性，
-    # Hit rate越高，证明prefill阶段挑出来的token在decoding阶段更被重视。
+    # Observe whether tokens selected by H2O strategy during prefill remain important during decoding.
+    # Higher hit rate indicates prefill-selected tokens are more valued during decoding.
     def h2o_recall(self, new_indices, num_key_value_group):
         bsz, kv_head, topk = self.non_recent_sink_topk_indices.shape
         if (new_indices.shape[1] // self.non_recent_sink_topk_indices.shape[1]) == num_key_value_group:

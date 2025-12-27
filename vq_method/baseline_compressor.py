@@ -1,20 +1,18 @@
+"""
+Baseline KV-cache compressors for comparison with PQCache.
+
+This module provides baseline compression implementations including H2O
+and full-KV oracle compressors used for benchmarking PQCache performance.
+"""
+
+from typing import List, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 from kmeans_gpu import KMeans
-from typing import Optional, List, Tuple
-import numpy as np
 
-def repeat(a, size, dim_idx):
-    shape = a.shape
-    return a.unsqueeze(dim_idx+1) \
-            .expand(*shape[:dim_idx], shape[dim_idx], size, *shape[dim_idx+1:]) \
-            .reshape(*shape[:dim_idx], shape[dim_idx] * size, *shape[dim_idx+1:])
-
-def unrepeat(a, size, dim_idx):
-    shape = a.shape
-    return a.reshape(*shape[:dim_idx], shape[dim_idx] // size, size, *shape[dim_idx+1:]) \
-            .select(dim_idx+1, 0) \
-            .squeeze(dim_idx+1)
+from .utils import repeat, unrepeat
 
 class KVCacheH2O(object):
     def __init__(self, compress_ratio, h2o_ratio, recent_ratio, drop_ratio, sink_size = 0, show_hit_rate = True):
