@@ -1,48 +1,114 @@
-import torch
-from kmeans_gpu import KMeans as KMeans_gpu
-from typing import Optional, List, Tuple
-import numpy as np
-from flash_attn import flash_attn_func
-from .retrieval_based_compressor import *
-import sys
-import os.path as osp
-from loguru import logger
-import math
+"""
+GPU Cache Manager for PQCache.
 
+This module provides the GPUCacheManager class that handles all GPU memory
+management for the KV-cache, including:
+- Efficient CPU-GPU data transfer with pinned memory
+- LFU (Least Frequently Used) caching for hot token blocks
+- Asynchronous data prefetching using CUDA streams
+- Block-based cache management for reduced transfer overhead
+
+The cache manager is a critical component for achieving low latency during
+LLM inference with long contexts.
+"""
+
+import math
+import os
+import os.path as osp
+import sys
+from typing import List, Optional, Tuple
+
+import numpy as np
+import torch
+from flash_attn import flash_attn_func
+from kmeans_gpu import KMeans as KMeans_gpu
+from loguru import logger
+
+from .global_timer import global_timer
+from .retrieval_based_compressor import repeat, unrepeat
+
+# Add LFU cache C++ extension to path
 sys.path.append(osp.join(osp.abspath(osp.dirname(__file__)), "lfu/build"))
 import lfucache
-from .global_timer import global_timer
 
-SYNC_TEST_TIME = eval(os.environ.get("SYNC_TEST_TIME","0"))
+# Environment configuration
+SYNC_TEST_TIME: bool = bool(int(os.environ.get("SYNC_TEST_TIME", "0")))
 
 cache_class = lfucache.LFUCache
 
-def init_gpu_cache_manager(**kwargs):
-    cache_manager = GPUCacheManager(
-        **kwargs,
-    )
-    logger.info("Cache manager init done. !!!!!!Warning you're running system in refactor mode!")
+
+def init_gpu_cache_manager(**kwargs) -> 'GPUCacheManager':
+    """
+    Factory function to create and initialize a GPUCacheManager.
+
+    Args:
+        **kwargs: Configuration parameters passed to GPUCacheManager.
+
+    Returns:
+        Initialized GPUCacheManager instance.
+    """
+    cache_manager = GPUCacheManager(**kwargs)
+    logger.info("Cache manager initialized successfully.")
     return cache_manager
 
-def pin_shm(bufs: List[torch.Tensor]):
-    # Copy from https://gist.github.com/colesbury/aae4361feb596353fcd219339d6c44ab
+def pin_shm(bufs: List[torch.Tensor]) -> None:
+    """
+    Register shared memory tensors as pinned memory for faster GPU transfers.
+
+    This enables zero-copy transfers between CPU shared memory and GPU,
+    significantly reducing data transfer latency.
+
+    Args:
+        bufs: List of shared memory tensors to pin.
+
+    Raises:
+        AssertionError: If tensors are not shared or pinning fails.
+
+    Reference:
+        https://gist.github.com/colesbury/aae4361feb596353fcd219339d6c44ab
+    """
     cudart = torch.cuda.cudart()
     for buf in bufs:
-        err = cudart.cudaHostRegister(buf.data_ptr(), buf.numel() * buf.element_size(), 0)
-        assert buf.is_shared()
-        assert buf.is_pinned()
-        assert err == 0, err
+        err = cudart.cudaHostRegister(
+            buf.data_ptr(), buf.numel() * buf.element_size(), 0
+        )
+        assert buf.is_shared(), "Buffer must be in shared memory"
+        assert buf.is_pinned(), "Buffer pinning failed"
+        assert err == 0, f"cudaHostRegister failed with error code {err}"
 
-def unpin_shm(bufs: List[torch.Tensor]):
-    # Copy from https://gist.github.com/colesbury/aae4361feb596353fcd219339d6c44ab
+
+def unpin_shm(bufs: List[torch.Tensor]) -> None:
+    """
+    Unregister previously pinned shared memory tensors.
+
+    Args:
+        bufs: List of pinned shared memory tensors to unpin.
+
+    Raises:
+        AssertionError: If unpinning fails.
+
+    Reference:
+        https://gist.github.com/colesbury/aae4361feb596353fcd219339d6c44ab
+    """
     lib = torch.cuda.cudart()
     for buf in bufs:
         err = lib.cudaHostUnregister(buf.data_ptr())
-        assert err == 0, err
+        assert err == 0, f"cudaHostUnregister failed with error code {err}"
 
-def create_event(device, interprocess=False):
+
+def create_event(device: torch.device, interprocess: bool = False) -> torch.cuda.Event:
+    """
+    Create a CUDA event on the specified device.
+
+    Args:
+        device: Target CUDA device for the event.
+        interprocess: Whether the event should be shareable across processes.
+
+    Returns:
+        CUDA event bound to the specified device.
+    """
     e = torch.cuda.Event(interprocess=interprocess)
-    # A workaround to set the device of torch.cuda.Event()
+    # Workaround to set the device of torch.cuda.Event()
     with torch.cuda.device(device):
         if interprocess:
             e.ipc_handle()
@@ -51,20 +117,79 @@ def create_event(device, interprocess=False):
     return e
 
 class GPUCacheManager:
-    def __init__(self, 
-                layer_cnt, 
-                n_kv_head, 
-                total_max_len, 
-                dim, 
-                device, 
-                dtype,
-                compress_ratio, 
-                local_ratio, 
-                sink_size,
-                global_cache_size,
-                cache_block_size,
-                cache_topk = -1,
-                ) -> None:
+    """
+    Manages GPU memory and caching for KV-cache in PQCache.
+
+    This class handles the complex memory management required for efficient
+    long-context LLM inference, including:
+
+    - **CPU-GPU Transfer**: Manages pinned memory buffers for fast async transfers
+    - **LFU Caching**: Keeps frequently accessed token blocks on GPU
+    - **Block-based Management**: Groups tokens into blocks for efficient caching
+    - **Multi-stream Processing**: Uses separate CUDA streams for overlapping
+      computation and data transfer
+
+    Memory Layout:
+        - cpu_key_buffers: Shared memory for keys (accessible by clustering workers)
+        - cpu_value_buffer: Pinned memory for values
+        - global_key_cache / global_value_cache: GPU cache for hot blocks
+        - key_buffer / value_buffer: Working buffers for attention computation
+
+    Attributes:
+        n_kv_head: Number of key-value attention heads.
+        dim: Dimension per attention head.
+        device: CUDA device for this cache manager.
+        global_cache_size: Number of tokens in GPU cache.
+        cache_block_size: Tokens per cache block.
+
+    Example:
+        >>> manager = GPUCacheManager(
+        ...     layer_cnt=32,
+        ...     n_kv_head=8,
+        ...     total_max_len=131072,
+        ...     dim=128,
+        ...     device=torch.device("cuda:0"),
+        ...     dtype=torch.float16,
+        ...     compress_ratio=0.2,
+        ...     local_ratio=0.5,
+        ...     sink_size=32,
+        ...     global_cache_size=8192,
+        ...     cache_block_size=256
+        ... )
+    """
+
+    def __init__(
+        self,
+        layer_cnt: int,
+        n_kv_head: int,
+        total_max_len: int,
+        dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        compress_ratio: float,
+        local_ratio: float,
+        sink_size: int,
+        global_cache_size: int,
+        cache_block_size: int,
+        cache_topk: int = -1,
+    ) -> None:
+        """
+        Initialize the GPU cache manager.
+
+        Args:
+            layer_cnt: Number of transformer layers managed by this instance.
+            n_kv_head: Number of key-value attention heads.
+            total_max_len: Maximum sequence length supported.
+            dim: Dimension per attention head.
+            device: CUDA device for GPU tensors.
+            dtype: Data type for tensors (typically torch.float16).
+            compress_ratio: Target compression ratio.
+            local_ratio: Fraction of compressed tokens from local window.
+            sink_size: Number of sink tokens to always keep.
+            global_cache_size: Size of GPU cache in tokens.
+            cache_block_size: Number of tokens per cache block.
+            cache_topk: Number of top blocks to cache (-1 for auto).
+        """
         self.bsz, self.n_kv_head, self.dim = 1, n_kv_head, dim
         self.local_ratio, self.compress_ratio, self.global_cache_size = local_ratio, compress_ratio, global_cache_size
         self.max_idx = total_max_len

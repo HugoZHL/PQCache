@@ -82,27 +82,98 @@ def initialize_objects(config, model):
 
     logger.info("Multi-core compressor init done.")
 
-def wait():
+
+def wait() -> None:
+    """Wait for all k-means clustering operations to complete."""
     global global_compressor
     global_compressor.wait_for_km_result()
 
-def del_objects():
+
+def del_objects() -> None:
+    """Clean up global PQCache objects and free resources."""
     global global_compressor
     global cache_managers
     del global_compressor
     for m in cache_managers:
         del m
-    
+
+
 class PqBasedSearchCompressor(RetrievalBasedCompressor):
-    all_pq_compressors = []
-    
-    def __init__(self, compress_ratio, recent_ratio, n_subvec_per_head, n_subbits, gqa, sink_size = 32, **kwargs):
-        self.compress_ratio = compress_ratio 
+    """
+    Product Quantization based KV-cache compressor.
+
+    This class implements the core PQCache compression algorithm. It uses
+    Product Quantization to build a compressed index of key vectors during
+    prefill, then uses this index for efficient approximate attention during
+    decoding.
+
+    The compression pipeline:
+    1. During prefill: Build PQ codebooks using multi-core k-means clustering
+    2. During decode: Use PQ-based MIPS to find top-k important tokens
+    3. Fetch selected tokens from CPU/GPU cache for attention computation
+
+    Attributes:
+        compress_ratio: Overall compression ratio (fraction of tokens to keep).
+        recent_ratio: Fraction of kept tokens that are recent (local window).
+        topk_ratio: Fraction of kept tokens selected via PQ search.
+        n_subvec_per_head: Number of sub-vectors per head for PQ.
+        n_subbits: Bits per sub-vector centroid (2^n_subbits centroids).
+        sink_size: Number of initial tokens to always keep.
+        GQA: Whether model uses Grouped Query Attention.
+
+    Example:
+        >>> compressor = PqBasedSearchCompressor(
+        ...     compress_ratio=0.2,  # Keep 20% of tokens
+        ...     recent_ratio=0.5,    # Half from local window
+        ...     n_subvec_per_head=2, # 2 sub-vectors per head
+        ...     n_subbits=6,         # 64 centroids per sub-vector
+        ...     gqa=True,            # Using GQA
+        ...     sink_size=32,        # Keep first 32 tokens
+        ...     **model_kwargs
+        ... )
+    """
+
+    # Class-level list to track all compressor instances for layer prefetching
+    all_pq_compressors: List['PqBasedSearchCompressor'] = []
+
+    def __init__(
+        self,
+        compress_ratio: float,
+        recent_ratio: float,
+        n_subvec_per_head: int,
+        n_subbits: int,
+        gqa: bool,
+        sink_size: int = 32,
+        **kwargs
+    ):
+        """
+        Initialize the PQ-based search compressor.
+
+        Args:
+            compress_ratio: Target compression ratio (0-1).
+            recent_ratio: Fraction of budget for recent/local tokens.
+            n_subvec_per_head: Number of sub-vectors per attention head.
+                Must be in [1, 2, 4, 8, 16].
+            n_subbits: Bits for centroid indexing (2^n_subbits centroids).
+            gqa: Whether the model uses Grouped Query Attention.
+            sink_size: Number of initial "sink" tokens to always preserve.
+            **kwargs: Additional arguments including:
+                - layer_idx: Index of this transformer layer
+                - num_layer_cnt: Total number of layers
+                - kv_head: Number of key-value heads
+                - dim: Head dimension
+                - cur_device: CUDA device
+                - max_iter: Max k-means iterations
+
+        Raises:
+            ConfigurationError: If n_subvec_per_head is not a valid value.
+        """
+        validate_subvec_count(n_subvec_per_head)
+
+        self.compress_ratio = compress_ratio
         self.recent_ratio = recent_ratio
         self.sink_size = sink_size
         self.topk_ratio = 1 - self.recent_ratio
-        if n_subvec_per_head not in [1,2,4,8,16]:
-            raise Exception("PQ subvec must in 1 2 4 8 16")
         self.n_subvec_per_head = n_subvec_per_head
         self.n_subbits = n_subbits
         self.recent_size = 0

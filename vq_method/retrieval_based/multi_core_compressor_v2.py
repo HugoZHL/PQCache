@@ -414,10 +414,10 @@ class MultiCoreCompressor_v2:
             max_iter = max(max_iter, 3)
             max_iter = min(max_iter, 300)
             if layer_idx == 0:
-                logger.info(f"multi core压缩器，max_iter:{max_iter}, base:{kmeans_base}, per_iter:{kmeans_per_round}, gpu_perlayer: {gpu_compute_time}") 
+                logger.info(f"Multi-core compressor: max_iter={max_iter}, base={kmeans_base:.2f}, per_iter={kmeans_per_round:.2f}, gpu_per_layer={gpu_compute_time:.2f}")
         else:
             if layer_idx == 0:
-                logger.info(f"multi core压缩器，max_iter:{max_iter}") 
+                logger.info(f"Multi-core compressor: max_iter={max_iter}") 
 
             pass
 
